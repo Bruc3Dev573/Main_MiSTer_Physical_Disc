@@ -201,6 +201,8 @@ void pcecd_set_image(int num, const char *filename)
 {
 	(void)num;
 
+	process_ss("", 0);
+
 	pcecdd.Unload();
 	pcecdd.state = PCECD_STATE_NODISC;
 
@@ -243,6 +245,8 @@ void pcecd_set_image(int num, const char *filename)
 			}
 
 			if (!loaded) Info("CD BIOS not found!", 4000);
+
+			process_ss(filename, loaded);
 
 			notify_mount(1);
 		}
