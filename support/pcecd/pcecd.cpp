@@ -22,49 +22,49 @@ void pcecd_poll()
 	static uint8_t last_req = 0;
 	static uint8_t adj = 0;
 
-	if (!poll_timer) poll_timer = GetTimer(13);
-
-	if (CheckTimer(poll_timer))
-	{
-		if ((!pcecdd.latency) && (pcecdd.state == PCECD_STATE_READ)) {
-			poll_timer += 16; // 16.0ms between frames if reading data */
-		} else {
-			poll_timer += 13 + ((adj == 3) ? 1 : 0); // 13.33ms otherwise (including latency counts) */
-			if (adj > 3) adj = 3;
-			if (--adj <= 0) adj = 3;
-		}
-
-		if (pcecdd.has_status && !pcecdd.latency) {
-
-			pcecdd.SendStatus(pcecdd.GetStatus());
-			pcecdd.has_status = 0;
-		}
-		else if (pcecdd.data_req && !pcecdd.latency) {
-
-			pcecdd.SendDataRequest();
-			pcecdd.data_req = false;
-		}
-
-		pcecdd.Update();
-	}
-
-
-	uint8_t req = spi_uio_cmd_cont(UIO_CD_GET);
-	if (req != last_req)
+	uint16_t status = spi_uio_cmd_cont(UIO_CD_GET);
+	uint8_t req = status;
+	bool pending = req != last_req;
+	uint16_t data_in[7];
+	if (pending)
 	{
 		last_req = req;
+		for (unsigned i = 0; i < 7; i++) data_in[i] = spi_w(0);
+	}
+	DisableIO();
 
-		uint16_t data_in[7];
-		data_in[0] = spi_w(0);
-		data_in[1] = spi_w(0);
-		data_in[2] = spi_w(0);
-		data_in[3] = spi_w(0);
-		data_in[4] = spi_w(0);
-		data_in[5] = spi_w(0);
-		data_in[6] = spi_w(0);
-		DisableIO();
+	// Pause timed delivery, not mailbox processing. Discard frozen timer debt.
+	if (status & 0x100) {
+		poll_timer = 0;
+	}
+	else
+	{
+		if (!poll_timer) poll_timer = GetTimer(13);
+		if (CheckTimer(poll_timer))
+		{
+			if ((!pcecdd.latency) && (pcecdd.state == PCECD_STATE_READ)) {
+				poll_timer += 16;
+			} else {
+				poll_timer += 13 + ((adj == 3) ? 1 : 0);
+				if (adj > 3) adj = 3;
+				if (--adj <= 0) adj = 3;
+			}
 
+			if (pcecdd.has_status && !pcecdd.latency) {
+				pcecdd.SendStatus(pcecdd.GetStatus());
+				pcecdd.has_status = 0;
+			}
+			else if (pcecdd.data_req && !pcecdd.latency) {
+				pcecdd.SendDataRequest();
+				pcecdd.data_req = false;
+			}
+			pcecdd.Update();
+		}
+	}
 
+	// Retain Update-before-command ordering, including the first D8 burst.
+	if (pending)
+	{
 		switch (data_in[6] & 0xFF)
 		{
 		case 0:
@@ -87,12 +87,7 @@ void pcecd_poll()
 			need_reset = 1;
 			break;
 		}
-
-
-		//printf("\x1b[32mMCD: Get command, command = %04X%04X%04X, has_command = %u\n\x1b[0m", data_in[2], data_in[1], data_in[0], has_command);
 	}
-	else
-		DisableIO();
 
 	if (need_reset) {
 		need_reset = 0;
@@ -100,7 +95,6 @@ void pcecd_poll()
 		poll_timer = 0;
 		printf("\x1b[32mPCECD: Reset\n\x1b[0m");
 	}
-
 }
 
 void pcecd_reset() {
