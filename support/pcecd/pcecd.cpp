@@ -19,6 +19,7 @@ static uint8_t has_command = 0;
 void pcecd_poll()
 {
 	static uint32_t poll_timer = 0;
+	static uint32_t hold_start = 0;
 	static uint8_t last_req = 0;
 	static uint8_t adj = 0;
 
@@ -33,12 +34,17 @@ void pcecd_poll()
 	}
 	DisableIO();
 
-	// Pause timed delivery, not mailbox processing. Discard frozen timer debt.
+	// Pause timed delivery, not mailbox processing. On release, shift an armed
+	// timer by the held time so delivery resumes on the pre-freeze schedule.
 	if (status & 0x100) {
-		poll_timer = 0;
+		if (!hold_start) hold_start = GetTimer(0);
 	}
 	else
 	{
+		if (hold_start) {
+			if (poll_timer) poll_timer += GetTimer(0) - hold_start;
+			hold_start = 0;
+		}
 		if (!poll_timer) poll_timer = GetTimer(13);
 		if (CheckTimer(poll_timer))
 		{
