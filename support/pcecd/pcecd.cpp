@@ -246,7 +246,9 @@ void pcecd_set_image(int num, const char *filename)
 
 			if (!loaded) Info("CD BIOS not found!", 4000);
 
-			process_ss(filename, loaded);
+			// A physical disc has no image path: name its slots after the disc,
+			// as the PSX path does, instead of the sentinel.
+			process_ss(phys ? save_name : filename, loaded);
 
 			notify_mount(1);
 		}
