@@ -39,6 +39,10 @@
 #define MCD_SUB_IO_INDEX 3
 #define MCD_CDDA_IO_INDEX 4
 
+// MegaCD slot size in 32-bit payload words, plus the two-word slot header.
+#define MCD_SS_WORDS 558430u
+#define MCD_SS_SIZE (8u + MCD_SS_WORDS * 4u)
+
 #include "../../cd.h"
 #include <libchdr/chd.h>
 
@@ -48,6 +52,8 @@ public:
 	uint32_t latency;
 	uint8_t status;
 	uint8_t isData;
+	// Drive target position, including a seek that has not reported its MSF yet.
+	int lba;
 	int loaded;
 	SendDataFunc SendData;
 	int (*CanSendData)(uint8_t type);
@@ -66,7 +72,6 @@ public:
 private:
 	toc_t toc;
 	int index;
-	int lba;
 	uint16_t sectorSize;
 	int scanOffset;
 	int audioLength;
@@ -106,5 +111,6 @@ void mcd_reset();
 int mcd_send_data(uint8_t* buf, int len, uint8_t index);
 int mcd_can_send_data(uint8_t type);
 void mcd_fill_blanksave(uint8_t *buffer, uint32_t lba);
+void mcd_ss_presave(void* base, int slot);
 
 #endif
