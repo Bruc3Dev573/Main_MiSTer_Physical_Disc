@@ -263,6 +263,8 @@ void user_io_store_filename(char *filename);
 int user_io_use_cheats();
 
 int process_ss(const char *rom_name, int enable = 1);
+void* process_ss_last_changed_base(uint32_t min_size);
+void* process_ss_slot_ptr(int i, uint32_t min_size);
 
 char is_f12_mod_needed();
 void diskled_on();

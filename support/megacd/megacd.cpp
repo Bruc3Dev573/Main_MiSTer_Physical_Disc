@@ -19,18 +19,86 @@
 #define MCD_GET_CMD        0
 #define MCD_GET_SEND_DATA  1
 
+// Spare CD_RESYNC words in the slot image hold the saved drive target and type.
+#define MCD_SS_CTX_MAGIC 0x4D434454u
+#define MCD_SS_CTX_WORD 558394u
+#define MCD_M68K_W97_BYTE ((557314u + 97u) * 4u + 8u)
+struct mcd_ss_ctx_t { int state; uint8_t status; uint8_t isData; uint16_t latency; int lba; };
+static mcd_ss_ctx_t mcd_ss_ctx[4] = {};
+static uint32_t ss_watch_cnt[4] = {};
+static uint8_t ss_watch_seen[4] = {};
+static uint8_t last_req = 255;
+static int mcd_ss_load_pending = 0;
+static uint32_t mcd_ss_restore_ms = 0;
+static uint64_t forced_status = 0;
+static int forced_status_valid = 0;
+static void mcd_restore_drive();
+
+static void mcd_ss_sanitize(void* base)
+{
+	// wendReg with no pending bus cycle in SIDLE cannot complete after restore.
+	uint32_t w;
+	memcpy(&w, (uint8_t*)base + MCD_M68K_W97_BYTE, 4);
+	if ((w & 0x1000) && !(w & 0x0100) && (w & 7) == 1) {
+		w &= ~0x1000u;
+		memcpy((uint8_t*)base + MCD_M68K_W97_BYTE, &w, 4);
+	}
+}
+
+static int mcd_ss_restore_guard()
+{
+	// Ignore the reset request sent by the restored core, but not an explicit mcd_reset().
+	return mcd_ss_restore_ms && (GetTimer(0) - mcd_ss_restore_ms) < 2000;
+}
+
+
 static int need_reset=0;
 static uint8_t has_command = 0;
 
 void mcd_poll()
 {
 	static uint32_t poll_timer = 0;
-	static uint8_t last_req = 255;
 	static uint8_t adj = 0;
 	static uint32_t swap_close_at = 0;
 
 
 
+
+	if (!poll_timer || CheckTimer(poll_timer))
+	{
+		// Restore the drive before the freeze check because the core waits for this handoff.
+		int fpga_ready = mcd_can_send_data(1);
+		int just_restored = 0;
+		if (mcd_ss_load_pending) {
+			mcd_restore_drive();
+			mcd_ss_load_pending = 0;
+			just_restored = 1;
+		}
+
+		// Capture the drive context before Update(), while the changed slot image is frozen.
+		// A load echo already carries its context and must not be overwritten.
+		for (int i = 0; i < 4; i++) {
+			uint32_t* b = (uint32_t*)process_ss_slot_ptr(i, MCD_SS_SIZE);
+			if (!b) { ss_watch_seen[i] = 0; continue; }
+			if (!ss_watch_seen[i]) { ss_watch_seen[i] = 1; ss_watch_cnt[i] = b[0]; continue; }
+			if (b[0] == ss_watch_cnt[i]) continue;
+			ss_watch_cnt[i] = b[0];
+			if (just_restored) {
+				mcd_ss_ctx[i].state = 2;
+			} else {
+				mcd_ss_ctx[i].state = 1;
+				mcd_ss_ctx[i].status = cdd.status;
+				mcd_ss_ctx[i].isData = cdd.isData;
+				mcd_ss_ctx[i].latency = (uint16_t)cdd.latency;
+				mcd_ss_ctx[i].lba = cdd.lba;
+			}
+		}
+
+		if (!fpga_ready) {
+			poll_timer = GetTimer(5);
+			return;
+		}
+	}
 
 	if (cdd.is_phys() && physical_disc_swap_consume() && cdd.SwapPhys())
 	{
@@ -77,7 +145,8 @@ void mcd_poll()
 
 		if (has_command) {
 			spi_uio_cmd_cont(UIO_CD_SET);
-			uint64_t s = cdd.GetStatus(0);
+			uint64_t s = forced_status_valid ? forced_status : cdd.GetStatus(0);
+			forced_status_valid = 0;
 			spi_w((s >> 0) & 0xFFFF);
 			spi_w((s >> 16) & 0xFFFF);
 			spi_w(((s >> 32) & 0x00FF) | (cdd.isData ? 0x01 << 8 : 0x00 << 8));
@@ -105,7 +174,7 @@ void mcd_poll()
 		data_in[2] = spi_w(0);
 		DisableIO();
 
-		if (need_reset || data_in[0] == 0xFF) {
+		if (need_reset || (data_in[0] == 0xFF && !mcd_ss_restore_guard())) {
 			printf("MCD: request to reset\n");
 			need_reset = 0;
 			cdd.Reset();
@@ -190,6 +259,18 @@ int mcd_set_image(int num, const char *filename)
 
 
 	if (phys) same_game = 0;
+	// Reset the savestate session state on a game change. Main stays running across mounts.
+	if (!same_game)
+	{
+		memset(mcd_ss_ctx, 0, sizeof(mcd_ss_ctx));
+		memset(ss_watch_cnt, 0, sizeof(ss_watch_cnt));
+		memset(ss_watch_seen, 0, sizeof(ss_watch_seen));
+		has_command = 0;
+		forced_status_valid = 0;
+		last_req = 255;
+		mcd_ss_load_pending = 0;
+		mcd_ss_restore_ms = 0;
+	}
 
 	strcpy(last_dir, filename);
 	char *p = strrchr(last_dir, '/');
@@ -299,6 +380,13 @@ int mcd_set_image(int num, const char *filename)
 					mcd_mount_save(filename);
 					cheats_init(filename, 0);
 				}
+			}
+			char state_name[64] = "physical_disc";
+			if (phys) physical_disc_save_name(PHYSICAL_DISC_DISC_MEGACD, state_name, sizeof(state_name));
+			process_ss(phys ? state_name : filename);
+			for (int i = 0; i < 4; i++) {
+				void* b = process_ss_slot_ptr(i, MCD_SS_SIZE);
+				if (b) mcd_ss_sanitize(b);
 			}
 		}
 		else
@@ -413,9 +501,7 @@ void mcd_fill_blanksave(uint8_t *buffer, uint32_t lba)
 }
 
 int mcd_can_send_data(uint8_t type) {
-	if (type == 1) {
-		return 1;
-	}
+	// Data and audio delivery both stop while the core is frozen.
 
 	// Ask the FPGA if it is ready to receive a sector
 	spi_uio_cmd_cont(UIO_CD_GET);
@@ -424,5 +510,158 @@ int mcd_can_send_data(uint8_t type) {
 	uint16_t data = spi_w(0);
 	DisableIO();
 
-	return (data == 1);
+	mcd_ss_load_pending = (data >> 1) & 1;
+	return data & 1;
+}
+
+void mcd_ss_presave(void* base, int slot)
+{
+	if (!base || slot < 0 || slot > 3) return;
+	mcd_ss_sanitize(base);
+	mcd_ss_ctx_t* c = &mcd_ss_ctx[slot];
+	if (c->state == 1) {
+		uint8_t* img = (uint8_t*)base;
+		uint32_t magic = MCD_SS_CTX_MAGIC;
+		uint32_t packed = (uint32_t)(c->status & 0xF) | (c->isData ? 0x10 : 0)
+		                | ((uint32_t)c->latency << 16);
+		uint32_t lba = (uint32_t)c->lba;
+		memcpy(img + 8 + (MCD_SS_CTX_WORD + 0) * 4, &magic, 4);
+		memcpy(img + 8 + (MCD_SS_CTX_WORD + 1) * 4, &packed, 4);
+		memcpy(img + 8 + (MCD_SS_CTX_WORD + 2) * 4, &lba, 4);
+	}
+	// Without a new capture, or for a load echo, the context words stay as they are.
+	c->state = 0;
+}
+
+static void mcd_restore_drive()
+{
+	mcd_ss_restore_ms = GetTimer(0);
+	spi_uio_cmd_cont(UIO_CD_GET);
+	spi_w(2); // Saved CDD status. Reading the third word acknowledges FW_HOLD.
+	uint16_t w0 = spi_w(0);
+	uint16_t w1 = spi_w(0);
+	uint16_t w2 = spi_w(0);
+	DisableIO();
+
+	uint64_t s = ((uint64_t)(w2 & 0xFF) << 32) | ((uint32_t)w1 << 16) | w0;
+	uint8_t status = s & 0xF;
+	uint8_t s1 = (s >> 4) & 0xF;
+
+	// A seek packet holds the old position and other reports can carry a stale
+	// type nibble. In both cases use the drive context saved in the slot.
+	{
+		uint8_t* img = (uint8_t*)process_ss_last_changed_base(MCD_SS_SIZE);
+		if (img) {
+			uint32_t magic, packed, ulba;
+			memcpy(&magic, img + 8 + (MCD_SS_CTX_WORD + 0) * 4, 4);
+			memcpy(&packed, img + 8 + (MCD_SS_CTX_WORD + 1) * 4, 4);
+			memcpy(&ulba, img + 8 + (MCD_SS_CTX_WORD + 2) * 4, 4);
+			int lba = (int)ulba;
+			uint8_t cstat = packed & 0xF;
+			int ctx_is_data = (packed >> 4) & 1;
+			int packet_is_data = (((s >> 32) & 0xF) == 0x4);
+			int stat_ok = (cstat == CD_STAT_PLAY || cstat == CD_STAT_SEEK ||
+			               cstat == CD_STAT_PAUSE);
+			int ctx_ok = (magic == MCD_SS_CTX_MAGIC && stat_ok &&
+			              lba >= 0 && lba < 80 * 60 * 75);
+			if (ctx_ok && (status == CD_STAT_SEEK || ctx_is_data != packet_is_data)) {
+				int lba150 = lba + 150;
+				int m = (lba150 / 75) / 60, sec = (lba150 / 75) % 60, f = lba150 % 75;
+				uint8_t d2 = m / 10, d3 = m % 10, d4 = sec / 10, d5 = sec % 10,
+				        d6 = f / 10, d7 = f % 10;
+				uint64_t c = (uint64_t)CD_COMM_PLAY
+				           | ((uint64_t)d2 << 8) | ((uint64_t)d3 << 12)
+				           | ((uint64_t)d4 << 16) | ((uint64_t)d5 << 20)
+				           | ((uint64_t)d6 << 24) | ((uint64_t)d7 << 28);
+				c |= (uint64_t)((~(CD_COMM_PLAY + d2 + d3 + d4 + d5 + d6 + d7)) & 0xF) << 36;
+				cdd.SetCommand(c, 0);
+				cdd.CommandExec();
+				if (cstat != CD_STAT_PLAY) {
+					cdd.SetCommand(CD_COMM_PAUSE | ((uint64_t)((~CD_COMM_PAUSE) & 0xF) << 36), 0);
+					cdd.CommandExec();
+				}
+				cdd.latency = 0;
+				goto proactive;
+			}
+		}
+	}
+
+	if (s1 != 0) return; // No absolute MSF in the packet.
+
+	// CDC data headers use byte-order BCD. Audio status uses stat[] nibble order.
+	// Declared without initializers so the goto above does not cross them.
+	int is_data, m, sec, f;
+	is_data = (((s >> 32) & 0xF) == 0x4);
+	if (is_data) {
+		m   = (int)((s >> 28) & 0xF) * 10 + (int)((s >> 24) & 0xF);
+		sec = (int)((s >> 20) & 0xF) * 10 + (int)((s >> 16) & 0xF);
+		f   = (int)((s >> 12) & 0xF) * 10 + (int)((s >>  8) & 0xF);
+	} else {
+		m   = (int)((s >>  8) & 0xF) * 10 + (int)((s >> 12) & 0xF);
+		sec = (int)((s >> 16) & 0xF) * 10 + (int)((s >> 20) & 0xF);
+		f   = (int)((s >> 24) & 0xF) * 10 + (int)((s >> 28) & 0xF);
+	}
+
+	// If the CDC header is torn, use the last absolute position saved with the status.
+	{
+		int msf_ok = 1;
+		for (int i = 2; i <= 7; i++)
+			if (((s >> (i * 4)) & 0xF) > 9) msf_ok = 0;
+		if (msf_ok && (m > 79 || sec >= 60 || f >= 75)) msf_ok = 0;
+		if (!msf_ok) {
+			uint8_t* img = (uint8_t*)process_ss_last_changed_base(MCD_SS_SIZE);
+			uint32_t rw2 = 0;
+			if (img) memcpy(&rw2, img + 8 + 558392u * 4, 4);
+			uint64_t alt = ((uint64_t)(rw2 & 0xFFFFFF)) << 8;
+			int am = (int)((alt >> 8) & 0xF) * 10 + (int)((alt >> 12) & 0xF);
+			int as = (int)((alt >> 16) & 0xF) * 10 + (int)((alt >> 20) & 0xF);
+			int af = (int)((alt >> 24) & 0xF) * 10 + (int)((alt >> 28) & 0xF);
+			int alt_ok = (rw2 != 0);
+			for (int i = 2; i <= 7; i++)
+				if (((alt >> (i * 4)) & 0xF) > 9) alt_ok = 0;
+			if (alt_ok && (am > 79 || as >= 60 || af >= 75)) alt_ok = 0;
+			if (alt_ok) {
+				m = am; sec = as; f = af;
+			} else {
+				printf("MCD: savestate load - no valid MSF, drive left as-is\n");
+				goto proactive;
+			}
+		}
+	}
+
+	{
+		// The decoded data sector was already consumed, so resume at the next one.
+		if (is_data) {
+			if (++f >= 75) { f = 0; if (++sec >= 60) { sec = 0; m++; } }
+		}
+		uint8_t d2 = m / 10, d3 = m % 10, d4 = sec / 10, d5 = sec % 10,
+		        d6 = f / 10, d7 = f % 10;
+		uint64_t c = (uint64_t)CD_COMM_PLAY
+		           | ((uint64_t)d2 << 8) | ((uint64_t)d3 << 12)
+		           | ((uint64_t)d4 << 16) | ((uint64_t)d5 << 20)
+		           | ((uint64_t)d6 << 24) | ((uint64_t)d7 << 28);
+		c |= (uint64_t)((~(CD_COMM_PLAY + d2 + d3 + d4 + d5 + d6 + d7)) & 0xF) << 36;
+		cdd.SetCommand(c, 0);
+		cdd.CommandExec();
+		if (status != CD_STAT_PLAY) {
+			cdd.SetCommand(CD_COMM_PAUSE | ((uint64_t)((~CD_COMM_PAUSE) & 0xF) << 36), 0);
+			cdd.CommandExec();
+		}
+		// The restored game driver must not see an extra seek delay.
+		cdd.latency = 0;
+	}
+
+proactive:
+	// Answer a pending CDD request with the saved status report as is.
+	{
+		uint8_t* img = (uint8_t*)process_ss_last_changed_base(MCD_SS_SIZE);
+		if (img) {
+			uint32_t rw0, rw1;
+			memcpy(&rw0, img + 8 + 558390u * 4, 4);
+			memcpy(&rw1, img + 8 + 558391u * 4, 4);
+			forced_status = ((uint64_t)(rw1 & 0xFF) << 32) | rw0;
+			forced_status_valid = 1;
+		}
+	}
+	has_command = 1;
 }

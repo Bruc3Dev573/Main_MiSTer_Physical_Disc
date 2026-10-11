@@ -1912,12 +1912,30 @@ static void kbd_fifo_poll()
 	kbd_fifo_r = (kbd_fifo_r + 1)&(KBD_FIFO_SIZE - 1);
 }
 
+static uint32_t ss_cnt[4] = {};
+static void *ss_slot_base[4] = {};
+static void *ss_last_changed = 0;
+
+// A slot whose counter changed since the last poll wins over the last saved slot.
+void* process_ss_last_changed_base(uint32_t min_size)
+{
+	if (!ss_base || min_size > ss_size) return 0;
+	for (int i = 0; i < 4; i++)
+		if (ss_slot_base[i] && ((uint32_t*)ss_slot_base[i])[0] != ss_cnt[i])
+			return ss_slot_base[i];
+	return ss_last_changed;
+}
+
+void* process_ss_slot_ptr(int i, uint32_t min_size)
+{
+	return (ss_base && min_size <= ss_size && i >= 0 && i < 4) ? ss_slot_base[i] : 0;
+}
+
 int process_ss(const char *rom_name, int enable)
 {
 	static char ss_name[1024] = {};
 	static char *ss_sufx = 0;
-	static uint32_t ss_cnt[4] = {};
-	static void *base[4] = {};
+	void **base = ss_slot_base;
 	static int enabled = 0;
 
 	if (!ss_base) return 0;
@@ -1926,6 +1944,7 @@ int process_ss(const char *rom_name, int enable)
 	{
 		enabled = enable;
 		if (!enabled) return 0;
+		ss_last_changed = 0;
 
 		uint32_t len = ss_size;
 		uint32_t map_addr = ss_base;
@@ -1994,10 +2013,13 @@ int process_ss(const char *rom_name, int enable)
 
 			if (curcnt != ss_cnt[i])
 			{
+				ss_last_changed = base[i];
 				ss_cnt[i] = curcnt;
-				if (size) size = (size + 2) * 4;
-				if (size > 0 && size <= ss_size)
+				// Check the payload size before converting it to bytes or writing the context.
+				if (size && ss_size >= 8 && size <= (ss_size - 8) / 4)
 				{
+					if (is_megacd() && size == MCD_SS_WORDS) mcd_ss_presave(base[i], i);
+					size = (size + 2) * 4;
 					MenuHide();
 					Info("Saving the state", 500);
 
