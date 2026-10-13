@@ -111,6 +111,6 @@ void mcd_reset();
 int mcd_send_data(uint8_t* buf, int len, uint8_t index);
 int mcd_can_send_data(uint8_t type);
 void mcd_fill_blanksave(uint8_t *buffer, uint32_t lba);
-void mcd_ss_presave(void* base, int slot);
+int mcd_ss_presave(void* base, int slot);
 
 #endif
