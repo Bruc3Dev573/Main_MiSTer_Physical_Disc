@@ -852,6 +852,16 @@ void cdd_t::Update() {
 				FileSeek(&this->toc.tracks[this->index].f, (this->toc.tracks[this->index].start * 2352) - this->toc.tracks[this->index].offset, SEEK_SET);
 			}
 		}
+
+		// Decompress the hunk of the next data sector now, while there is a whole
+		// sector period to spare. Done when the sector is sent, it delays the first
+		// sector of every hunk by several ms, and the CDC raises its decoder interrupt
+		// when a sector arrives. Flashback's FMV player can then read a frame header
+		// that has not been transferred yet and hang at the end of a cutscene.
+		if (this->toc.chd_f && this->index < this->toc.last && this->toc.tracks[this->index].type && this->lba >= 0)
+		{
+			mister_chd_read_sector(this->toc.chd_f, this->lba + this->toc.tracks[0].offset, 0, 0, 0, this->chd_hunkbuf, this->chd_hunkbuf, &this->chd_hunknum);
+		}
 	}
 	else if (cdd.status == CD_STAT_SCAN)
 	{
