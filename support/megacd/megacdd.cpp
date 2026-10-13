@@ -11,6 +11,7 @@
 
 #include "megacd.h"
 #include "../../cfg.h"
+#include "../../user_io.h"
 #include "../chd/mister_chd.h"
 #include "../physical_disc/physical_disc.h"
 
@@ -1287,10 +1288,22 @@ void cdd_t::MSFToLBA(int* lba, msf_t* msf) {
 void cdd_t::SeekToLBA(int lba, int play) {
 	int index = 0;
 
-	this->latency = 0;
-	if (play)
+	if (is_megacd())
 	{
-		this->latency = 11;
+		// Genesis Plus GX drive model: a play or a seek starts one CDD interrupt after the
+		// command and then keeps the drive busy for at least 12 interrupts, unless a previous
+		// access is still running, plus the seek distance. Here the access starts at once, so
+		// the base is 13. Wolf Team games hang when a short access completes sooner: Thunder
+		// Storm FX (Japan) froze on the Sega logo with 11 and still did 3 times in 4 with 12.
+		if (!this->latency) this->latency = 13;
+	}
+	else
+	{
+		this->latency = 0;
+		if (play)
+		{
+			this->latency = 11;
+		}
 	}
 
 	this->latency += (abs(lba - this->lba) * 120) / 270000;
