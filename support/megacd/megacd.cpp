@@ -514,11 +514,17 @@ int mcd_can_send_data(uint8_t type) {
 	return data & 1;
 }
 
-void mcd_ss_presave(void* base, int slot)
+// Returns 0 when the counter change is the core's echo of a load: the slot image is
+// then what was read from the file, and writing it back would only rewrite the file.
+int mcd_ss_presave(void* base, int slot)
 {
-	if (!base || slot < 0 || slot > 3) return;
-	mcd_ss_sanitize(base);
+	if (!base || slot < 0 || slot > 3) return 1;
 	mcd_ss_ctx_t* c = &mcd_ss_ctx[slot];
+	if (c->state == 2) {
+		c->state = 0;
+		return 0;
+	}
+	mcd_ss_sanitize(base);
 	if (c->state == 1) {
 		uint8_t* img = (uint8_t*)base;
 		uint32_t magic = MCD_SS_CTX_MAGIC;
@@ -529,8 +535,9 @@ void mcd_ss_presave(void* base, int slot)
 		memcpy(img + 8 + (MCD_SS_CTX_WORD + 1) * 4, &packed, 4);
 		memcpy(img + 8 + (MCD_SS_CTX_WORD + 2) * 4, &lba, 4);
 	}
-	// Without a new capture, or for a load echo, the context words stay as they are.
+	// Without a new capture the context words stay as they are.
 	c->state = 0;
+	return 1;
 }
 
 static void mcd_restore_drive()

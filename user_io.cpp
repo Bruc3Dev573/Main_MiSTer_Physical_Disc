@@ -2016,9 +2016,9 @@ int process_ss(const char *rom_name, int enable)
 				ss_last_changed = base[i];
 				ss_cnt[i] = curcnt;
 				// Check the payload size before converting it to bytes or writing the context.
-				if (size && ss_size >= 8 && size <= (ss_size - 8) / 4)
+				if (size && ss_size >= 8 && size <= (ss_size - 8) / 4 &&
+				    !(is_megacd() && size == MCD_SS_WORDS && !mcd_ss_presave(base[i], i)))
 				{
-					if (is_megacd() && size == MCD_SS_WORDS) mcd_ss_presave(base[i], i);
 					size = (size + 2) * 4;
 					MenuHide();
 					Info("Saving the state", 500);
