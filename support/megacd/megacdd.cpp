@@ -770,6 +770,8 @@ void cdd_t::Reset() {
 	stat[7] = 0x0;
 	stat[8] = 0x0;
 	stat[9] = 0xF;
+
+	memset(last_comm, 0, sizeof(last_comm));
 }
 
 void cdd_t::Update() {
@@ -922,7 +924,17 @@ void cdd_t::Update() {
 void cdd_t::CommandExec() {
 	msf_t msf;
 
-	switch (comm[0]) {
+	// While HOCK is set the core resends the command registers every frame. A play or
+	// seek resent unchanged must not restart the access, so it only reports the status
+	// like IDLE. The same command written again by software still restarts it.
+	uint8_t cmd = comm[0];
+	if (this->resend && (cmd == CD_COMM_PLAY || cmd == CD_COMM_SEEK || cmd == CD_COMM_TRACK_PLAY) &&
+	    !memcmp(comm, last_comm, sizeof(comm)))
+		cmd = CD_COMM_IDLE;
+	this->resend = 0;
+	memcpy(last_comm, comm, sizeof(comm));
+
+	switch (cmd) {
 	case CD_COMM_IDLE:
 		if (this->latency <= 3)
 		{

@@ -211,6 +211,8 @@ void mcd_poll()
 
 		uint64_t c = *((uint64_t*)(data_in));
 		cdd.SetCommand(c, 0);
+		// Bit 40: the core resends its command registers every frame while HOCK is set.
+		cdd.resend = (data_in[2] >> 8) & 1;
 		cdd.CommandExec();
 		has_command = 1;
 
