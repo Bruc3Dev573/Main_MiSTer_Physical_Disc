@@ -57,6 +57,9 @@ public:
 	int loaded;
 	SendDataFunc SendData;
 	int (*CanSendData)(uint8_t type);
+	// Set before CommandExec() when the core resent its command registers unchanged
+	// instead of handing over a command software wrote. CommandExec() clears it.
+	uint8_t resend;
 
 	cdd_t();
 	int Load(const char *filename);
@@ -81,6 +84,7 @@ private:
 	int chd_audio_read_lba;
 	uint8_t stat[10];
 	uint8_t comm[10];
+	uint8_t last_comm[10];
 
 	int LoadCUE(const char* filename);
 	int LoadCHD(const char* filename);
