@@ -23,8 +23,8 @@
 #define MCD_SS_CTX_MAGIC 0x4D434454u
 #define MCD_SS_CTX_WORD 558394u
 #define MCD_M68K_W97_BYTE ((557314u + 97u) * 4u + 8u)
-struct mcd_ss_ctx_t { int state; uint8_t status; uint8_t isData; uint16_t latency; int lba; };
-static mcd_ss_ctx_t mcd_ss_ctx[4] = {};
+// Per slot: 1 after a save whose file is not written yet, 2 after a load echo.
+static uint8_t mcd_ss_state[4] = {};
 static uint32_t ss_watch_cnt[4] = {};
 static uint8_t ss_watch_seen[4] = {};
 static uint8_t last_req = 255;
@@ -43,6 +43,31 @@ static void mcd_ss_sanitize(void* base)
 		w &= ~0x1000u;
 		memcpy((uint8_t*)base + MCD_M68K_W97_BYTE, &w, 4);
 	}
+}
+
+// Writes the drive context into a slot image right after the save, so a load that
+// comes before the slot file is written still finds it.
+static void mcd_ss_store_ctx(void* base)
+{
+	uint8_t* img = (uint8_t*)base;
+	uint32_t magic = MCD_SS_CTX_MAGIC;
+	uint32_t packed = (uint32_t)(cdd.status & 0xF) | (cdd.isData ? 0x10 : 0)
+	                | ((uint32_t)(uint16_t)cdd.latency << 16);
+	uint32_t lba = (uint32_t)cdd.lba;
+	mcd_ss_sanitize(base);
+	memcpy(img + 8 + (MCD_SS_CTX_WORD + 0) * 4, &magic, 4);
+	memcpy(img + 8 + (MCD_SS_CTX_WORD + 1) * 4, &packed, 4);
+	memcpy(img + 8 + (MCD_SS_CTX_WORD + 2) * 4, &lba, 4);
+}
+
+// The slot being loaded is the one whose counter changed since the last poll.
+static void* mcd_ss_loaded_base()
+{
+	for (int i = 0; i < 4; i++) {
+		uint32_t* b = (uint32_t*)process_ss_slot_ptr(i, MCD_SS_SIZE);
+		if (b && ss_watch_seen[i] && b[0] != ss_watch_cnt[i]) return b;
+	}
+	return process_ss_last_changed_base(MCD_SS_SIZE);
 }
 
 static int mcd_ss_restore_guard()
@@ -76,21 +101,25 @@ void mcd_poll()
 		}
 
 		// Capture the drive context before Update(), while the changed slot image is frozen.
-		// A load echo already carries its context and must not be overwritten.
+		// A load echo already carries its context and must not be overwritten. A load of a
+		// slot whose file is not written yet keeps it pending.
 		for (int i = 0; i < 4; i++) {
 			uint32_t* b = (uint32_t*)process_ss_slot_ptr(i, MCD_SS_SIZE);
 			if (!b) { ss_watch_seen[i] = 0; continue; }
 			if (!ss_watch_seen[i]) { ss_watch_seen[i] = 1; ss_watch_cnt[i] = b[0]; continue; }
 			if (b[0] == ss_watch_cnt[i]) continue;
+			// A load writes the counter just before it signals the load. Seen in between,
+			// the change is left to the next poll, which restores the drive first.
+			if (!just_restored) {
+				mcd_can_send_data(1);
+				if (mcd_ss_load_pending) break;
+			}
 			ss_watch_cnt[i] = b[0];
 			if (just_restored) {
-				mcd_ss_ctx[i].state = 2;
+				if (mcd_ss_state[i] != 1) mcd_ss_state[i] = 2;
 			} else {
-				mcd_ss_ctx[i].state = 1;
-				mcd_ss_ctx[i].status = cdd.status;
-				mcd_ss_ctx[i].isData = cdd.isData;
-				mcd_ss_ctx[i].latency = (uint16_t)cdd.latency;
-				mcd_ss_ctx[i].lba = cdd.lba;
+				mcd_ss_state[i] = 1;
+				if (b[1] == MCD_SS_WORDS) mcd_ss_store_ctx(b);
 			}
 		}
 
@@ -262,7 +291,7 @@ int mcd_set_image(int num, const char *filename)
 	// Reset the savestate session state on a game change. Main stays running across mounts.
 	if (!same_game)
 	{
-		memset(mcd_ss_ctx, 0, sizeof(mcd_ss_ctx));
+		memset(mcd_ss_state, 0, sizeof(mcd_ss_state));
 		memset(ss_watch_cnt, 0, sizeof(ss_watch_cnt));
 		memset(ss_watch_seen, 0, sizeof(ss_watch_seen));
 		has_command = 0;
@@ -519,24 +548,13 @@ int mcd_can_send_data(uint8_t type) {
 int mcd_ss_presave(void* base, int slot)
 {
 	if (!base || slot < 0 || slot > 3) return 1;
-	mcd_ss_ctx_t* c = &mcd_ss_ctx[slot];
-	if (c->state == 2) {
-		c->state = 0;
+	if (mcd_ss_state[slot] == 2) {
+		mcd_ss_state[slot] = 0;
 		return 0;
 	}
+	// mcd_poll() has written the drive context of a new save into the image already.
 	mcd_ss_sanitize(base);
-	if (c->state == 1) {
-		uint8_t* img = (uint8_t*)base;
-		uint32_t magic = MCD_SS_CTX_MAGIC;
-		uint32_t packed = (uint32_t)(c->status & 0xF) | (c->isData ? 0x10 : 0)
-		                | ((uint32_t)c->latency << 16);
-		uint32_t lba = (uint32_t)c->lba;
-		memcpy(img + 8 + (MCD_SS_CTX_WORD + 0) * 4, &magic, 4);
-		memcpy(img + 8 + (MCD_SS_CTX_WORD + 1) * 4, &packed, 4);
-		memcpy(img + 8 + (MCD_SS_CTX_WORD + 2) * 4, &lba, 4);
-	}
-	// Without a new capture the context words stay as they are.
-	c->state = 0;
+	mcd_ss_state[slot] = 0;
 	return 1;
 }
 
@@ -554,42 +572,49 @@ static void mcd_restore_drive()
 	uint8_t status = s & 0xF;
 	uint8_t s1 = (s >> 4) & 0xF;
 
+	uint8_t* img = (uint8_t*)mcd_ss_loaded_base();
+	uint32_t rw2 = 0;
+	if (img) memcpy(&rw2, img + 8 + 558392u * 4, 4);
+	// Last non-IDLE command handed to the drive before the save, 0 if the core does not save it.
+	uint8_t lastcmd = (rw2 >> 24) & 0xF;
+
 	// A seek packet holds the old position and other reports can carry a stale
-	// type nibble. In both cases use the drive context saved in the slot.
-	{
-		uint8_t* img = (uint8_t*)process_ss_last_changed_base(MCD_SS_SIZE);
-		if (img) {
-			uint32_t magic, packed, ulba;
-			memcpy(&magic, img + 8 + (MCD_SS_CTX_WORD + 0) * 4, 4);
-			memcpy(&packed, img + 8 + (MCD_SS_CTX_WORD + 1) * 4, 4);
-			memcpy(&ulba, img + 8 + (MCD_SS_CTX_WORD + 2) * 4, 4);
-			int lba = (int)ulba;
-			uint8_t cstat = packed & 0xF;
-			int ctx_is_data = (packed >> 4) & 1;
-			int packet_is_data = (((s >> 32) & 0xF) == 0x4);
-			int stat_ok = (cstat == CD_STAT_PLAY || cstat == CD_STAT_SEEK ||
-			               cstat == CD_STAT_PAUSE);
-			int ctx_ok = (magic == MCD_SS_CTX_MAGIC && stat_ok &&
-			              lba >= 0 && lba < 80 * 60 * 75);
-			if (ctx_ok && (status == CD_STAT_SEEK || ctx_is_data != packet_is_data)) {
-				int lba150 = lba + 150;
-				int m = (lba150 / 75) / 60, sec = (lba150 / 75) % 60, f = lba150 % 75;
-				uint8_t d2 = m / 10, d3 = m % 10, d4 = sec / 10, d5 = sec % 10,
-				        d6 = f / 10, d7 = f % 10;
-				uint64_t c = (uint64_t)CD_COMM_PLAY
-				           | ((uint64_t)d2 << 8) | ((uint64_t)d3 << 12)
-				           | ((uint64_t)d4 << 16) | ((uint64_t)d5 << 20)
-				           | ((uint64_t)d6 << 24) | ((uint64_t)d7 << 28);
-				c |= (uint64_t)((~(CD_COMM_PLAY + d2 + d3 + d4 + d5 + d6 + d7)) & 0xF) << 36;
-				cdd.SetCommand(c, 0);
+	// type nibble. A packet that does not match the last play or seek command
+	// answers an earlier command. In these cases use the drive context saved in the slot.
+	if (img) {
+		uint32_t magic, packed, ulba;
+		memcpy(&magic, img + 8 + (MCD_SS_CTX_WORD + 0) * 4, 4);
+		memcpy(&packed, img + 8 + (MCD_SS_CTX_WORD + 1) * 4, 4);
+		memcpy(&ulba, img + 8 + (MCD_SS_CTX_WORD + 2) * 4, 4);
+		int lba = (int)ulba;
+		uint8_t cstat = packed & 0xF;
+		int ctx_is_data = (packed >> 4) & 1;
+		int packet_is_data = (((s >> 32) & 0xF) == 0x4);
+		int stat_ok = (cstat == CD_STAT_PLAY || cstat == CD_STAT_SEEK ||
+		               cstat == CD_STAT_PAUSE);
+		// Plays usually start in the pregap before the target, at a negative LBA.
+		int ctx_ok = (magic == MCD_SS_CTX_MAGIC && stat_ok &&
+		              lba >= -150 && lba + 150 < 80 * 60 * 75);
+		int stale = ((lastcmd == CD_COMM_PLAY || lastcmd == CD_COMM_TRACK_PLAY) && status != CD_STAT_PLAY) ||
+		            (lastcmd == CD_COMM_SEEK && status != CD_STAT_PAUSE);
+		if (ctx_ok && (status == CD_STAT_SEEK || stale || ctx_is_data != packet_is_data)) {
+			int lba150 = lba + 150;
+			int m = (lba150 / 75) / 60, sec = (lba150 / 75) % 60, f = lba150 % 75;
+			uint8_t d2 = m / 10, d3 = m % 10, d4 = sec / 10, d5 = sec % 10,
+			        d6 = f / 10, d7 = f % 10;
+			uint64_t c = (uint64_t)CD_COMM_PLAY
+			           | ((uint64_t)d2 << 8) | ((uint64_t)d3 << 12)
+			           | ((uint64_t)d4 << 16) | ((uint64_t)d5 << 20)
+			           | ((uint64_t)d6 << 24) | ((uint64_t)d7 << 28);
+			c |= (uint64_t)((~(CD_COMM_PLAY + d2 + d3 + d4 + d5 + d6 + d7)) & 0xF) << 36;
+			cdd.SetCommand(c, 0);
+			cdd.CommandExec();
+			if (cstat != CD_STAT_PLAY) {
+				cdd.SetCommand(CD_COMM_PAUSE | ((uint64_t)((~CD_COMM_PAUSE) & 0xF) << 36), 0);
 				cdd.CommandExec();
-				if (cstat != CD_STAT_PLAY) {
-					cdd.SetCommand(CD_COMM_PAUSE | ((uint64_t)((~CD_COMM_PAUSE) & 0xF) << 36), 0);
-					cdd.CommandExec();
-				}
-				cdd.latency = 0;
-				goto proactive;
 			}
+			cdd.latency = 0;
+			goto proactive;
 		}
 	}
 
@@ -616,14 +641,12 @@ static void mcd_restore_drive()
 			if (((s >> (i * 4)) & 0xF) > 9) msf_ok = 0;
 		if (msf_ok && (m > 79 || sec >= 60 || f >= 75)) msf_ok = 0;
 		if (!msf_ok) {
-			uint8_t* img = (uint8_t*)process_ss_last_changed_base(MCD_SS_SIZE);
-			uint32_t rw2 = 0;
-			if (img) memcpy(&rw2, img + 8 + 558392u * 4, 4);
+			// Bits 27:24 hold the last command, so check only the MSF bits.
 			uint64_t alt = ((uint64_t)(rw2 & 0xFFFFFF)) << 8;
 			int am = (int)((alt >> 8) & 0xF) * 10 + (int)((alt >> 12) & 0xF);
 			int as = (int)((alt >> 16) & 0xF) * 10 + (int)((alt >> 20) & 0xF);
 			int af = (int)((alt >> 24) & 0xF) * 10 + (int)((alt >> 28) & 0xF);
-			int alt_ok = (rw2 != 0);
+			int alt_ok = ((rw2 & 0xFFFFFF) != 0);
 			for (int i = 2; i <= 7; i++)
 				if (((alt >> (i * 4)) & 0xF) > 9) alt_ok = 0;
 			if (alt_ok && (am > 79 || as >= 60 || af >= 75)) alt_ok = 0;
@@ -660,15 +683,12 @@ static void mcd_restore_drive()
 
 proactive:
 	// Answer a pending CDD request with the saved status report as is.
-	{
-		uint8_t* img = (uint8_t*)process_ss_last_changed_base(MCD_SS_SIZE);
-		if (img) {
-			uint32_t rw0, rw1;
-			memcpy(&rw0, img + 8 + 558390u * 4, 4);
-			memcpy(&rw1, img + 8 + 558391u * 4, 4);
-			forced_status = ((uint64_t)(rw1 & 0xFF) << 32) | rw0;
-			forced_status_valid = 1;
-		}
+	if (img) {
+		uint32_t rw0, rw1;
+		memcpy(&rw0, img + 8 + 558390u * 4, 4);
+		memcpy(&rw1, img + 8 + 558391u * 4, 4);
+		forced_status = ((uint64_t)(rw1 & 0xFF) << 32) | rw0;
+		forced_status_valid = 1;
 	}
 	has_command = 1;
 }
