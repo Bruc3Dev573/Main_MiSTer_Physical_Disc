@@ -1428,7 +1428,7 @@ int cdd_t::ReadCDDA(uint8_t *buf)
 	{
 		for(int i = 0; i < this->audioLength / 2352; i++)
 		{
-			mister_chd_read_sector(this->toc.chd_f, this->chd_audio_read_lba + this->toc.tracks[this->index].offset, 2352*i, 0, 2352, buf, this->chd_hunkbuf, &this->chd_hunknum);
+			mister_chd_read_sector(this->toc.chd_f, this->chd_audio_read_lba + i + this->toc.tracks[this->index].offset, 2352*i, 0, 2352, buf, this->chd_hunkbuf, &this->chd_hunknum);
 		}
 
 		//CHD audio requires byteswap. There's probably a better way to do this...
