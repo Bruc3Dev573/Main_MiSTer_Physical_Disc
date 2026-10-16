@@ -1533,8 +1533,13 @@ int cdd_t::SectorSend(uint8_t* header)
 	uint8_t index = MCD_DATA_IO_INDEX;
 
 	if (header) {
+		// The core stores the whole sector in the CDC buffer: send the sync pattern and a
+		// zeroed EDC/ECC area instead of leftover stack bytes.
+		memset(buf, 0xFF, 12);
+		buf[0] = buf[11] = 0x00;
 		memcpy(buf + 12, header, 4);
 		ReadData(buf + 16);
+		memset(buf + 16 + 2048, 0, 2352 - 16 - 2048);
 	}
 	else {
 		index = MCD_CDDA_IO_INDEX;
