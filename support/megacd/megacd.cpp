@@ -616,6 +616,13 @@ static void mcd_restore_drive()
 				cdd.CommandExec();
 			}
 			cdd.latency = 0;
+			// A stale packet answers the command before the pending one. Repeated, it
+			// would answer a play with the pause before it, so the drive answers instead.
+			if (stale) {
+				forced_status_valid = 0;
+				has_command = 1;
+				return;
+			}
 			goto proactive;
 		}
 	}
