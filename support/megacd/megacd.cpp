@@ -575,14 +575,20 @@ static void mcd_restore_drive()
 	uint8_t s1 = (s >> 4) & 0xF;
 
 	uint8_t* img = (uint8_t*)mcd_ss_loaded_base();
-	uint32_t rw2 = 0;
+	uint32_t rw0 = 0, rw2 = 0;
+	if (img) memcpy(&rw0, img + 8 + 558390u * 4, 4);
 	if (img) memcpy(&rw2, img + 8 + 558392u * 4, 4);
 	// Last non-IDLE command handed to the drive before the save, 0 if the core does not save it.
 	uint8_t lastcmd = (rw2 >> 24) & 0xF;
+	// The core hands over the last absolute position with a type nibble of 0. When the saved
+	// report is of another type (relative time, track, busy), that position is as old as the
+	// last absolute report, which can be many frames behind the drive.
+	int saved_no_msf = ((rw0 >> 4) & 0xF) != 0;
 
 	// A seek packet holds the old position and other reports can carry a stale
 	// type nibble. A packet that does not match the last play or seek command
-	// answers an earlier command. In these cases use the drive context saved in the slot.
+	// answers an earlier command. In these cases, and when the saved report has no
+	// absolute time, use the drive context saved in the slot.
 	if (img) {
 		uint32_t magic, packed, ulba;
 		memcpy(&magic, img + 8 + (MCD_SS_CTX_WORD + 0) * 4, 4);
@@ -599,7 +605,7 @@ static void mcd_restore_drive()
 		              lba >= -150 && lba + 150 < 80 * 60 * 75);
 		int stale = ((lastcmd == CD_COMM_PLAY || lastcmd == CD_COMM_TRACK_PLAY) && status != CD_STAT_PLAY) ||
 		            (lastcmd == CD_COMM_SEEK && status != CD_STAT_PAUSE);
-		if (ctx_ok && (status == CD_STAT_SEEK || stale || ctx_is_data != packet_is_data)) {
+		if (ctx_ok && (status == CD_STAT_SEEK || stale || saved_no_msf || ctx_is_data != packet_is_data)) {
 			int lba150 = lba + 150;
 			int m = (lba150 / 75) / 60, sec = (lba150 / 75) % 60, f = lba150 % 75;
 			uint8_t d2 = m / 10, d3 = m % 10, d4 = sec / 10, d5 = sec % 10,
@@ -616,6 +622,13 @@ static void mcd_restore_drive()
 				cdd.CommandExec();
 			}
 			cdd.latency = 0;
+			// A stale packet answers the command before the pending one. Repeated, it
+			// would answer a play with the pause before it, so the drive answers instead.
+			if (stale) {
+				forced_status_valid = 0;
+				has_command = 1;
+				return;
+			}
 			goto proactive;
 		}
 	}
@@ -686,8 +699,7 @@ static void mcd_restore_drive()
 proactive:
 	// Answer a pending CDD request with the saved status report as is.
 	if (img) {
-		uint32_t rw0, rw1;
-		memcpy(&rw0, img + 8 + 558390u * 4, 4);
+		uint32_t rw1;
 		memcpy(&rw1, img + 8 + 558391u * 4, 4);
 		forced_status = ((uint64_t)(rw1 & 0xFF) << 32) | rw0;
 		forced_status_valid = 1;
