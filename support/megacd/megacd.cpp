@@ -605,7 +605,22 @@ static void mcd_restore_drive()
 		              lba >= -150 && lba + 150 < 80 * 60 * 75);
 		int stale = ((lastcmd == CD_COMM_PLAY || lastcmd == CD_COMM_TRACK_PLAY) && status != CD_STAT_PLAY) ||
 		            (lastcmd == CD_COMM_SEEK && status != CD_STAT_PAUSE);
-		if (ctx_ok && (status == CD_STAT_SEEK || stale || saved_no_msf || ctx_is_data != packet_is_data)) {
+		// A data play hands over the CDC's last header, and the drive resumes at the sector
+		// after it. The play is reported from 3 updates before the first sector of the
+		// access, so that header can still be the last one of the stream before. While a
+		// data play streams, the saved drive position is the sector after that header.
+		int head_old = 0;
+		if (packet_is_data && status == CD_STAT_PLAY && cstat == CD_STAT_PLAY && ctx_is_data) {
+			int msf_ok = 1;
+			for (int i = 2; i <= 7; i++)
+				if (((s >> (i * 4)) & 0xF) > 9) msf_ok = 0;
+			int hm = (int)((s >> 28) & 0xF) * 10 + (int)((s >> 24) & 0xF);
+			int hs = (int)((s >> 20) & 0xF) * 10 + (int)((s >> 16) & 0xF);
+			int hf = (int)((s >> 12) & 0xF) * 10 + (int)((s >>  8) & 0xF);
+			if (msf_ok && hm <= 79 && hs < 60 && hf < 75)
+				head_old = (hm * 60 + hs) * 75 + hf - 150 + 1 != lba;
+		}
+		if (ctx_ok && (status == CD_STAT_SEEK || stale || saved_no_msf || ctx_is_data != packet_is_data || head_old)) {
 			int lba150 = lba + 150;
 			int m = (lba150 / 75) / 60, sec = (lba150 / 75) % 60, f = lba150 % 75;
 			uint8_t d2 = m / 10, d3 = m % 10, d4 = sec / 10, d5 = sec % 10,
