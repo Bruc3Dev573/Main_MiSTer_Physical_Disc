@@ -586,9 +586,9 @@ static void mcd_restore_drive()
 	int saved_no_msf = ((rw0 >> 4) & 0xF) != 0;
 
 	// A seek packet holds the old position and other reports can carry a stale
-	// type nibble. A packet that does not match the last play or seek command
-	// answers an earlier command. In these cases, and when the saved report has no
-	// absolute time, use the drive context saved in the slot.
+	// type nibble. A packet that does not match the last play, seek, resume or pause
+	// command answers an earlier command. In these cases, and when the saved report has
+	// no absolute time, use the drive context saved in the slot.
 	if (img) {
 		uint32_t magic, packed, ulba;
 		memcpy(&magic, img + 8 + (MCD_SS_CTX_WORD + 0) * 4, 4);
@@ -604,7 +604,9 @@ static void mcd_restore_drive()
 		int ctx_ok = (magic == MCD_SS_CTX_MAGIC && stat_ok &&
 		              lba >= -150 && lba + 150 < 80 * 60 * 75);
 		int stale = ((lastcmd == CD_COMM_PLAY || lastcmd == CD_COMM_TRACK_PLAY) && status != CD_STAT_PLAY) ||
-		            (lastcmd == CD_COMM_SEEK && status != CD_STAT_PAUSE);
+		            (lastcmd == CD_COMM_SEEK && status != CD_STAT_PAUSE) ||
+		            (lastcmd == CD_COMM_RESUME && status != CD_STAT_PLAY) ||
+		            (lastcmd == CD_COMM_PAUSE && status != CD_STAT_PAUSE);
 		// A data play hands over the CDC's last header, and the drive resumes at the sector
 		// after it. The play is reported from 3 updates before the first sector of the
 		// access, so that header can still be the last one of the stream before. While a
