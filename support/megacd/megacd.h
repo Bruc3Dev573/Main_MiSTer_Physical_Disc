@@ -90,7 +90,7 @@ private:
 	int LoadCHD(const char* filename);
 	int SectorSend(uint8_t* header);
 	int SubcodeSend();
-	void ReadData(uint8_t *buf);
+	int ReadData(uint8_t *buf);
 	int ReadCDDA(uint8_t *buf);
 	int ReadSubcode(uint16_t* buf);
 	void LBAToMSF(int lba, msf_t* msf);

@@ -1367,34 +1367,59 @@ void cdd_t::SeekToLBA(int lba, int play) {
 
 }
 
-void cdd_t::ReadData(uint8_t *buf)
+// Reads the current data sector. Images with 2352-byte sectors hold it whole, as on the
+// disc (CHD restores the sync and the ECC it strips), and 1 is returned. Others only hold
+// the 2048 bytes of user data, stored at buf + 16. A physical disc is read raw (READ CD
+// with sync, headers, user data and EDC/ECC), as the drive returns it after its own
+// error correction.
+int cdd_t::ReadData(uint8_t *buf)
 {
-	if (this->toc.tracks[this->index].type && (this->lba >= 0))
+	if (!this->toc.tracks[this->index].type || this->lba < 0) return 0;
+
+	int raw = (this->sectorSize != 2048);
+	int len = raw ? 2352 : 2048;
+	uint8_t *dst = raw ? buf : buf + 16;
+
+	if (this->toc.phys)
 	{
+		physical_disc_read_sector(this->lba, buf, NULL);
+		return 1;
+	}
 
-		if (this->toc.phys)
-		{
-			physical_disc_read_data2048(this->lba, buf);
-		}
-		else if (this->toc.chd_f)
-		{
-			int read_offset = 0;
-			if (this->sectorSize != 2048)
-			{
-				read_offset += 16;
-			}
+	if (this->toc.chd_f)
+	{
+		mister_chd_read_sector(this->toc.chd_f, this->lba + this->toc.tracks[0].offset, 0, 0, len, dst, this->chd_hunkbuf, &this->chd_hunknum);
+	} else {
+		FileSeek(&this->toc.tracks[0].f, this->lba * len, SEEK_SET);
+		FileReadAdv(&this->toc.tracks[0].f, dst, len);
+	}
 
-			mister_chd_read_sector(this->toc.chd_f, this->lba + this->toc.tracks[0].offset, 0, read_offset, 2048, buf, this->chd_hunkbuf, &this->chd_hunknum);
-		} else {
-			if (this->sectorSize == 2048)
-			{
-				FileSeek(&this->toc.tracks[0].f, this->lba * 2048, SEEK_SET);
-			} else {
-			FileSeek(&this->toc.tracks[0].f, this->lba * 2352 + 16, SEEK_SET);
-			}
-			FileReadAdv(&this->toc.tracks[0].f, buf, 2048);
+	return raw;
+}
+
+// Mode 1 EDC (CRC-32, reflected polynomial 0xD8018001, no inversion) over the sync, the
+// header and the user data, then the P and Q parity.
+static void FillEdcEcc(uint8_t *sector)
+{
+	static uint32_t edc_table[256];
+	if (!edc_table[255])
+	{
+		for (uint32_t i = 0; i < 256; i++)
+		{
+			uint32_t c = i;
+			for (int k = 0; k < 8; k++) c = (c >> 1) ^ ((c & 1) ? 0xD8018001 : 0);
+			edc_table[i] = c;
 		}
 	}
+
+	uint32_t edc = 0;
+	for (int i = 0; i < 2064; i++) edc = (edc >> 8) ^ edc_table[(edc ^ sector[i]) & 0xFF];
+	sector[2064] = edc;
+	sector[2065] = edc >> 8;
+	sector[2066] = edc >> 16;
+	sector[2067] = edc >> 24;
+	memset(sector + 2068, 0, 8);
+	ecc_generate(sector);
 }
 
 int cdd_t::ReadCDDA(uint8_t *buf)
@@ -1533,13 +1558,15 @@ int cdd_t::SectorSend(uint8_t* header)
 	uint8_t index = MCD_DATA_IO_INDEX;
 
 	if (header) {
-		// The core stores the whole sector in the CDC buffer: send the sync pattern and a
-		// zeroed EDC/ECC area instead of leftover stack bytes.
-		memset(buf, 0xFF, 12);
-		buf[0] = buf[11] = 0x00;
-		memcpy(buf + 12, header, 4);
-		ReadData(buf + 16);
-		memset(buf + 16 + 2048, 0, 2352 - 16 - 2048);
+		// The core stores the whole sector in the CDC buffer. When the image only holds
+		// the user data, rebuild the sync, the header, the EDC and the ECC of the disc.
+		if (!ReadData(buf))
+		{
+			memset(buf, 0xFF, 12);
+			buf[0] = buf[11] = 0x00;
+			memcpy(buf + 12, header, 4);
+			FillEdcEcc(buf);
+		}
 	}
 	else {
 		index = MCD_CDDA_IO_INDEX;
