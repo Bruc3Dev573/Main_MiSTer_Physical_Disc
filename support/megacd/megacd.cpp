@@ -80,10 +80,24 @@ static int mcd_ss_restore_guard()
 static int need_reset=0;
 static uint8_t has_command = 0;
 
+static void mcd_send_status(uint64_t s, int data)
+{
+	spi_uio_cmd_cont(UIO_CD_SET);
+	spi_w((s >> 0) & 0xFFFF);
+	spi_w((s >> 16) & 0xFFFF);
+	spi_w(((s >> 32) & 0x00FF) | (data ? 0x01 << 8 : 0x00 << 8));
+	DisableIO();
+
+	//printf("\x1b[32mMCD: Send status, status = %04X%04X%04X, frame = %u\n\x1b[0m", (uint16_t)((s >> 32) & 0x00FF), (uint16_t)((s >> 16) & 0xFFFF), (uint16_t)((s >> 0) & 0xFFFF), frame);
+}
+
 void mcd_poll()
 {
 	static uint32_t poll_timer = 0;
 	static uint8_t adj = 0;
+	static uint32_t status_timer = 0;
+	static uint64_t status = 0;
+	static int status_data = 0;
 	static uint32_t swap_close_at = 0;
 
 
@@ -172,21 +186,34 @@ void mcd_poll()
 			if (++adj >= 3) adj = 0;
 		}
 
-		if (has_command) {
-			spi_uio_cmd_cont(UIO_CD_SET);
-			uint64_t s = forced_status_valid ? forced_status : cdd.GetStatus(0);
+		// The status saved with a loaded state goes out at once, before the first sector.
+		if (has_command && forced_status_valid) {
+			mcd_send_status(forced_status, cdd.isData);
 			forced_status_valid = 0;
-			spi_w((s >> 0) & 0xFFFF);
-			spi_w((s >> 16) & 0xFFFF);
-			spi_w(((s >> 32) & 0x00FF) | (cdd.isData ? 0x01 << 8 : 0x00 << 8));
-			DisableIO();
-
 			has_command = 0;
+		}
 
-			//printf("\x1b[32mMCD: Send status, status = %04X%04X%04X, frame = %u\n\x1b[0m", (uint16_t)((s >> 32) & 0x00FF), (uint16_t)((s >> 16) & 0xFFFF), (uint16_t)((s >> 0) & 0xFFFF), frame);
+		// The drive sends its status about 3 ms after the sector it reports, and about
+		// 10 ms before the next one. The status is taken now, before that sector is sent,
+		// so a command that comes within the 3 ms does not move the reported position past it.
+		if (has_command) {
+			status = cdd.GetStatus(0);
+			status_data = cdd.isData;
+			status_timer = GetTimer(3);
+			has_command = 0;
 		}
 
 		cdd.Update();
+	}
+
+	if (status_timer && CheckTimer(status_timer))
+	{
+		status_timer = 0;
+
+		// No status while the core is frozen or a load waits for the drive restore: the
+		// next update takes it again.
+		if (mcd_can_send_data(1) && !mcd_ss_load_pending) mcd_send_status(status, status_data);
+		else has_command = 1;
 	}
 
 
