@@ -123,7 +123,10 @@ static void mcd_get_command(uint8_t req)
 void mcd_poll()
 {
 	static uint32_t poll_timer = 0;
-	static uint8_t adj = 0;
+	// Drive updates of data and stopped drives on a 75 Hz grid: update n of the grid is due
+	// grid_ms + n * 40/3 ms (13, 13, 14 ms ...), whenever the loop got to the update before.
+	static uint32_t grid_ms = 0;
+	static uint32_t grid_n = 0;
 	static uint32_t status_timer = 0;
 	static uint64_t status = 0;
 	static int status_data = 0;
@@ -207,14 +210,27 @@ void mcd_poll()
 			if (++paced_adj >= 4) paced_adj = 0;
 			if (CheckTimer(next + 50)) next = GetTimer(13);
 			poll_timer = next;
-			adj = 0;
+			grid_ms = 0;
 		} else if (!cdd.isData && cdd.status == CD_STAT_PLAY && cdd.latency == 0) {
 			// Send audio sectors faster so buffer stays filled
 			poll_timer = GetTimer(10);
-			adj = 0;
+			grid_ms = 0;
 		} else {
-			poll_timer = GetTimer(13 + (!adj ? 1 : 0));
-			if (++adj >= 3) adj = 0;
+			// A drive keeps 75 Hz on its own clock: after a late update the next one is
+			// still due on the grid, so the late interval is made up by a short one and
+			// the frame rate stays 75 Hz. Updates come at least 7 ms apart, so after a stall
+			// the missed frames are caught up one by one, never as a burst of sectors. More
+			// than two frames behind (a slot file write, a savestate freeze), the grid starts
+			// again from now and those frames are dropped, as a burst of them would not be
+			// what a drive does either.
+			uint32_t now = GetTimer(0);
+			if (!grid_ms || (int32_t)(now - (grid_ms + (uint32_t)((uint64_t)grid_n * 40 / 3))) >= 27) {
+				grid_ms = now;
+				grid_n = 0;
+			}
+			grid_n++;
+			uint32_t due = grid_ms + (uint32_t)((uint64_t)grid_n * 40 / 3);
+			poll_timer = ((int32_t)(due - (now + 7)) > 0) ? due : now + 7;
 		}
 
 		// When Main's loop has stalled, a status taken at the last update can still be
