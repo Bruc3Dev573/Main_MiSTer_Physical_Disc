@@ -91,6 +91,9 @@ static void mcd_send_status(uint64_t s, int data)
 	//printf("\x1b[32mMCD: Send status, status = %04X%04X%04X, frame = %u\n\x1b[0m", (uint16_t)((s >> 32) & 0x00FF), (uint16_t)((s >> 16) & 0xFFFF), (uint16_t)((s >> 0) & 0xFFFF), frame);
 }
 
+// Time of the last command from the core, in ms (0: none yet).
+static uint32_t last_command_ms = 0;
+
 // Reads the command the core handed over (req is the core's command counter).
 static void mcd_get_command(uint8_t req)
 {
@@ -116,6 +119,8 @@ static void mcd_get_command(uint8_t req)
 	cdd.resend = (data_in[2] >> 8) & 1;
 	cdd.CommandExec();
 	has_command = 1;
+	last_command_ms = GetTimer(0);
+	if (!last_command_ms) last_command_ms = 1;
 
 	//printf("\x1b[32mMCD: Get command, command = %04X%04X%04X, has_command = %u\n\x1b[0m", data_in[2], data_in[1], data_in[0], has_command);
 }
@@ -256,7 +261,11 @@ void mcd_poll()
 		// The drive sends its status about 3 ms after the sector it reports, and about
 		// 10 ms before the next one. The status is taken now, before that sector is sent,
 		// so a command that comes within the 3 ms does not move the reported position past it.
-		if (has_command) {
+		// While the host clocks commands (one came in the last two frames) the drive answers
+		// every frame, also when the frame's command has not come yet: after a stall of
+		// Main's loop the updates catch up faster than the core resends its command, and
+		// without this those updates would send no status and the frame rate would drop.
+		if (has_command || (last_command_ms && (int32_t)(GetTimer(0) - last_command_ms) < 27)) {
 			status = cdd.GetStatus(0);
 			status_data = cdd.isData;
 			status_timer = GetTimer(3);
