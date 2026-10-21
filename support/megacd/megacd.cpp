@@ -91,6 +91,35 @@ static void mcd_send_status(uint64_t s, int data)
 	//printf("\x1b[32mMCD: Send status, status = %04X%04X%04X, frame = %u\n\x1b[0m", (uint16_t)((s >> 32) & 0x00FF), (uint16_t)((s >> 16) & 0xFFFF), (uint16_t)((s >> 0) & 0xFFFF), frame);
 }
 
+// Reads the command the core handed over (req is the core's command counter).
+static void mcd_get_command(uint8_t req)
+{
+	last_req = req;
+
+	spi_w(MCD_GET_CMD);
+
+	uint16_t data_in[4];
+	data_in[0] = spi_w(0);
+	data_in[1] = spi_w(0);
+	data_in[2] = spi_w(0);
+	DisableIO();
+
+	if (need_reset || (data_in[0] == 0xFF && !mcd_ss_restore_guard())) {
+		printf("MCD: request to reset\n");
+		need_reset = 0;
+		cdd.Reset();
+	}
+
+	uint64_t c = *((uint64_t*)(data_in));
+	cdd.SetCommand(c, 0);
+	// Bit 40: the core resends its command registers every frame while HOCK is set.
+	cdd.resend = (data_in[2] >> 8) & 1;
+	cdd.CommandExec();
+	has_command = 1;
+
+	//printf("\x1b[32mMCD: Get command, command = %04X%04X%04X, has_command = %u\n\x1b[0m", data_in[2], data_in[1], data_in[0], has_command);
+}
+
 void mcd_poll()
 {
 	static uint32_t poll_timer = 0;
@@ -112,6 +141,8 @@ void mcd_poll()
 			mcd_restore_drive();
 			mcd_ss_load_pending = 0;
 			just_restored = 1;
+			// A status taken before the load answers nothing now.
+			status_timer = 0;
 		}
 
 		// Capture the drive context before Update(), while the changed slot image is frozen.
@@ -186,6 +217,19 @@ void mcd_poll()
 			if (++adj >= 3) adj = 0;
 		}
 
+		// When Main's loop has stalled, a status taken at the last update can still be
+		// waiting, and the core's next command can have come in meanwhile. The status goes
+		// out now and the command is taken before the update, as they would have been
+		// without the stall: otherwise the status is overwritten or the update finds no
+		// command, and the drive skips a status.
+		if (status_timer) {
+			status_timer = 0;
+			mcd_send_status(status, status_data);
+		}
+		uint8_t pending = spi_uio_cmd_cont(UIO_CD_GET);
+		if (pending != last_req) mcd_get_command(pending);
+		else DisableIO();
+
 		// The status saved with a loaded state goes out at once, before the first sector.
 		if (has_command && forced_status_valid) {
 			mcd_send_status(forced_status, cdd.isData);
@@ -218,34 +262,7 @@ void mcd_poll()
 
 
 	uint8_t req = spi_uio_cmd_cont(UIO_CD_GET);
-	if (req != last_req)
-	{
-		last_req = req;
-
-		spi_w(MCD_GET_CMD);
-
-		uint16_t data_in[4];
-		data_in[0] = spi_w(0);
-		data_in[1] = spi_w(0);
-		data_in[2] = spi_w(0);
-		DisableIO();
-
-		if (need_reset || (data_in[0] == 0xFF && !mcd_ss_restore_guard())) {
-			printf("MCD: request to reset\n");
-			need_reset = 0;
-			cdd.Reset();
-		}
-
-		uint64_t c = *((uint64_t*)(data_in));
-		cdd.SetCommand(c, 0);
-		// Bit 40: the core resends its command registers every frame while HOCK is set.
-		cdd.resend = (data_in[2] >> 8) & 1;
-		cdd.CommandExec();
-		has_command = 1;
-
-
-		//printf("\x1b[32mMCD: Get command, command = %04X%04X%04X, has_command = %u\n\x1b[0m", data_in[2], data_in[1], data_in[0], has_command);
-	}
+	if (req != last_req) mcd_get_command(req);
 	else
 		DisableIO();
 }
