@@ -1937,11 +1937,20 @@ int process_ss(const char *rom_name, int enable)
 	static char *ss_sufx = 0;
 	void **base = ss_slot_base;
 	static int enabled = 0;
+	// A slot file is written a piece per call, so that Main's loop keeps running while the
+	// card takes it. Written in one go, the loop stopped for about 150 ms, and with it the
+	// CD drive of the MegaCD core: the game saw the drive stall after every save, and read
+	// again. A slot saved again while its file is written is written again at the next
+	// check; a load echo changes only the counter.
+	static FileSaveJob ss_job = {};
+	static int ss_job_slot = -1;
 
 	if (!ss_base) return 0;
 
 	if (rom_name)
 	{
+		if (ss_job_slot >= 0) FileSaveAbort(&ss_job);
+		ss_job_slot = -1;
 		enabled = enable;
 		if (!enabled) return 0;
 		ss_last_changed = 0;
@@ -1999,11 +2008,21 @@ int process_ss(const char *rom_name, int enable)
 
 	if (!enabled) return 0;
 
+	if (ss_job_slot >= 0)
+	{
+		int ret = FileSaveStep(&ss_job, 64 * 1024);
+		if (ret <= 0)
+		{
+			if (!ret) printf("Wrote %d bytes to file: %s\n", ss_job.size, ss_job.path);
+			ss_job_slot = -1;
+		}
+		return 1;
+	}
+
 	static unsigned long ss_timer = 0;
 	if (ss_timer && !CheckTimer(ss_timer)) return 0;
 	ss_timer = GetTimer(1000);
 
-	fileTYPE f = {};
 	for (int i = 0; i < 4; i++)
 	{
 		if (base[i])
@@ -2024,15 +2043,11 @@ int process_ss(const char *rom_name, int enable)
 					Info("Saving the state", 500);
 
 					*ss_sufx = i + '1';
-					if (FileOpenEx(&f, ss_name, O_CREAT | O_TRUNC | O_RDWR | O_SYNC))
+					if (FileSaveBegin(&ss_job, ss_name, base[i], size))
 					{
-						int ret = FileWriteAdv(&f, base[i], size);
-						FileClose(&f);
-						printf("Wrote %d bytes to file: %s\n", ret, ss_name);
-					}
-					else
-					{
-						printf("Unable to create file: %s\n", ss_name);
+						ss_job_slot = i;
+						// The other changed slots wait for the next check.
+						break;
 					}
 				}
 			}

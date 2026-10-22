@@ -115,6 +115,19 @@ void FileGenerateSavestatePath(const char *name, char* out_name, int sufx);
 void FileGenerateScreenshotName(const char *name, char *out_name, const char *extension, int buflen);
 
 int FileSave(const char *name, void *pBuffer, int size);
+// FileSave a piece at a time: FileSaveBegin (0 on error), then FileSaveStep until it
+// returns 0 (the file is in place) or -1 (error, nothing replaced). FileSaveAbort drops
+// an unfinished write.
+struct FileSaveJob
+{
+	int fd;
+	int size, done;
+	const uint8_t *buf;
+	char path[2100];
+};
+int FileSaveBegin(FileSaveJob *job, const char *name, const void *pBuffer, int size);
+int FileSaveStep(FileSaveJob *job, int max);
+void FileSaveAbort(FileSaveJob *job);
 int FileLoad(const char *name, void *pBuffer, int size); // supply pBuffer = 0 to get the file size without loading
 int FileDelete(const char *name);
 int DirDelete(const char *name);

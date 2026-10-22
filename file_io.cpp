@@ -734,27 +734,55 @@ int FileWriteSec(fileTYPE *file, void *pBuffer)
 	return FileWriteAdv(file, pBuffer, 512);
 }
 
-int FileSave(const char *name, void *pBuffer, int size)
+int FileSaveBegin(FileSaveJob *job, const char *name, const void *pBuffer, int size)
 {
 	make_fullpath(name);
+	snprintf(job->path, sizeof(job->path), "%s", full_path);
+	job->buf = (const uint8_t*)pBuffer;
+	job->size = size;
+	job->done = 0;
 
-	int fd = open(full_path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, S_IRWXU | S_IRWXG | S_IRWXO);
-	if (fd < 0)
+	job->fd = open(job->path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, S_IRWXU | S_IRWXG | S_IRWXO);
+	if (job->fd < 0)
 	{
-		printf("FileSave(open) File:%s, error: %d.\n", full_path, fd);
+		printf("FileSave(open) File:%s, error: %d.\n", job->path, job->fd);
 		return 0;
 	}
+	return 1;
+}
 
-	int ret = write(fd, pBuffer, size);
-	close(fd);
+void FileSaveAbort(FileSaveJob *job)
+{
+	if (job->fd < 0) return;
+	close(job->fd);
+	job->fd = -1;
+}
 
+int FileSaveStep(FileSaveJob *job, int max)
+{
+	int len = job->size - job->done;
+	if (len > max) len = max;
+	int ret = write(job->fd, job->buf + job->done, len);
 	if (ret < 0)
 	{
-		printf("FileSave(write) File:%s, error: %d.\n", full_path, ret);
-		return 0;
+		printf("FileSave(write) File:%s, error: %d.\n", job->path, ret);
+		FileSaveAbort(job);
+		return -1;
 	}
+	job->done += ret;
+	if (ret == len && job->done < job->size) return 1;
 
-	return ret;
+	FileSaveAbort(job);
+	return 0;
+}
+
+int FileSave(const char *name, void *pBuffer, int size)
+{
+	FileSaveJob job;
+	if (!FileSaveBegin(&job, name, pBuffer, size)) return 0;
+	int ret;
+	while ((ret = FileSaveStep(&job, size)) > 0);
+	return ret ? 0 : job.done;
 }
 
 int FileDelete(const char *name)
