@@ -22,6 +22,12 @@
 // Spare CD_RESYNC words in the slot image hold the saved drive target and type.
 #define MCD_SS_CTX_MAGIC 0x4D434454u
 #define MCD_SS_CTX_WORD 558394u
+// Bits of the context's second word. ANSWER: the context tells whether a status taken
+// for the core was still waiting at the save (contexts written before do not); WAIT: one
+// was, its bits 39:32 are in bits 15:8 and bits 31:0 in the fourth context word.
+#define MCD_SS_CTX_ANSWER 0x20u
+#define MCD_SS_CTX_WAIT 0x40u
+#define MCD_SS_CTX_WAIT_DATA 0x80u
 #define MCD_M68K_W97_BYTE ((557314u + 97u) * 4u + 8u)
 // Per slot: 1 after a save whose file is not written yet, 2 after a load echo.
 static uint8_t mcd_ss_state[4] = {};
@@ -32,6 +38,10 @@ static int mcd_ss_load_pending = 0;
 static uint32_t mcd_ss_restore_ms = 0;
 static uint64_t forced_status = 0;
 static int forced_status_valid = 0;
+// A status that was waiting at the save of the loaded state, to be sent again.
+static uint64_t restored_wait_status = 0;
+static int restored_wait_data = 0;
+static int restored_wait_valid = 0;
 static void mcd_restore_drive();
 
 static void mcd_ss_sanitize(void* base)
@@ -46,18 +56,26 @@ static void mcd_ss_sanitize(void* base)
 }
 
 // Writes the drive context into a slot image right after the save, so a load that
-// comes before the slot file is written still finds it.
-static void mcd_ss_store_ctx(void* base)
+// comes before the slot file is written still finds it. wait: a status taken for the
+// core had not gone out yet (wait_status, wait_data).
+static void mcd_ss_store_ctx(void* base, int wait, uint64_t wait_status, int wait_data)
 {
 	uint8_t* img = (uint8_t*)base;
 	uint32_t magic = MCD_SS_CTX_MAGIC;
 	uint32_t packed = (uint32_t)(cdd.status & 0xF) | (cdd.isData ? 0x10 : 0)
-	                | ((uint32_t)(uint16_t)cdd.latency << 16);
+	                | ((uint32_t)(uint16_t)cdd.latency << 16) | MCD_SS_CTX_ANSWER;
 	uint32_t lba = (uint32_t)cdd.lba;
+	uint32_t wait_lo = 0;
+	if (wait) {
+		packed |= MCD_SS_CTX_WAIT | (wait_data ? MCD_SS_CTX_WAIT_DATA : 0)
+		        | ((uint32_t)((wait_status >> 32) & 0xFF) << 8);
+		wait_lo = (uint32_t)wait_status;
+	}
 	mcd_ss_sanitize(base);
 	memcpy(img + 8 + (MCD_SS_CTX_WORD + 0) * 4, &magic, 4);
 	memcpy(img + 8 + (MCD_SS_CTX_WORD + 1) * 4, &packed, 4);
 	memcpy(img + 8 + (MCD_SS_CTX_WORD + 2) * 4, &lba, 4);
+	memcpy(img + 8 + (MCD_SS_CTX_WORD + 3) * 4, &wait_lo, 4);
 }
 
 // The slot being loaded is the one whose counter changed since the last poll.
@@ -149,8 +167,16 @@ void mcd_poll()
 			mcd_restore_drive();
 			mcd_ss_load_pending = 0;
 			just_restored = 1;
-			// A status taken before the load answers nothing now.
+			// A status taken before the load answers nothing now. One that was waiting
+			// at the save of the loaded state goes out first, before the next sector, as
+			// it would have without the save.
 			status_timer = 0;
+			if (restored_wait_valid) {
+				status = restored_wait_status;
+				status_data = restored_wait_data;
+				status_timer = GetTimer(1);
+				restored_wait_valid = 0;
+			}
 		}
 
 		// Capture the drive context before Update(), while the changed slot image is frozen.
@@ -172,7 +198,7 @@ void mcd_poll()
 				if (mcd_ss_state[i] != 1) mcd_ss_state[i] = 2;
 			} else {
 				mcd_ss_state[i] = 1;
-				if (b[1] == MCD_SS_WORDS) mcd_ss_store_ctx(b);
+				if (b[1] == MCD_SS_WORDS) mcd_ss_store_ctx(b, status_timer != 0, status, status_data);
 			}
 		}
 
@@ -284,12 +310,14 @@ void mcd_poll()
 
 	if (status_timer && CheckTimer(status_timer))
 	{
-		status_timer = 0;
-
-		// No status while the core is frozen or a load waits for the drive restore: the
-		// next update takes it again.
-		if (mcd_can_send_data(1) && !mcd_ss_load_pending) mcd_send_status(status, status_data);
-		else has_command = 1;
+		// A status that falls in a freeze waits until the core runs again, and goes out
+		// before the next sector: the sector it reports has reached the core, and without
+		// its status the drive would skip one. A load drops it when it restores the drive.
+		if (mcd_can_send_data(1)) {
+			status_timer = 0;
+			mcd_send_status(status, status_data);
+		}
+		else status_timer = GetTimer(1);
 	}
 
 
@@ -661,6 +689,31 @@ static void mcd_restore_drive()
 	// last absolute report, which can be many frames behind the drive.
 	int saved_no_msf = ((rw0 >> 4) & 0xF) != 0;
 
+	// The core's saved report is the last status it received, which the software has
+	// taken already. Sent again, it is an extra status, and it answers the software's next
+	// command with the report of the one before. A context that tells whether a status
+	// was waiting at the save gives what the core was owed instead: that status, or none.
+	// The drive then reports again in answer to the next command it gets: the restore
+	// leaves the report of its own play (a seek) in the drive, which would otherwise go
+	// out as the first status of a running stream.
+	int ctx_answer = 0;
+	restored_wait_valid = 0;
+	if (img) {
+		uint32_t cm, cp, clo;
+		memcpy(&cm, img + 8 + (MCD_SS_CTX_WORD + 0) * 4, 4);
+		memcpy(&cp, img + 8 + (MCD_SS_CTX_WORD + 1) * 4, 4);
+		memcpy(&clo, img + 8 + (MCD_SS_CTX_WORD + 3) * 4, 4);
+		if (cm == MCD_SS_CTX_MAGIC && (cp & MCD_SS_CTX_ANSWER)) {
+			ctx_answer = 1;
+			has_command = 0;
+			if (cp & MCD_SS_CTX_WAIT) {
+				restored_wait_status = ((uint64_t)((cp >> 8) & 0xFF) << 32) | clo;
+				restored_wait_data = (cp & MCD_SS_CTX_WAIT_DATA) != 0;
+				restored_wait_valid = 1;
+			}
+		}
+	}
+
 	// A seek packet holds the old position and other reports can carry a stale
 	// type nibble. A packet that does not match the last play, seek, resume or pause
 	// command answers an earlier command. In these cases, and when the saved report has
@@ -719,7 +772,7 @@ static void mcd_restore_drive()
 			// would answer a play with the pause before it, so the drive answers instead.
 			if (stale) {
 				forced_status_valid = 0;
-				has_command = 1;
+				has_command = !ctx_answer;
 				return;
 			}
 			goto proactive;
@@ -790,12 +843,14 @@ static void mcd_restore_drive()
 	}
 
 proactive:
-	// Answer a pending CDD request with the saved status report as is.
-	if (img) {
+	// Answer a pending CDD request with the saved status report as is, when the slot
+	// does not tell what the core was owed.
+	if (img && !ctx_answer) {
 		uint32_t rw1;
 		memcpy(&rw1, img + 8 + 558391u * 4, 4);
 		forced_status = ((uint64_t)(rw1 & 0xFF) << 32) | rw0;
 		forced_status_valid = 1;
 	}
-	has_command = 1;
+	else forced_status_valid = 0;
+	has_command = !ctx_answer;
 }
