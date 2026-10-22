@@ -767,7 +767,11 @@ static void mcd_restore_drive()
 				cdd.SetCommand(CD_COMM_PAUSE | ((uint64_t)((~CD_COMM_PAUSE) & 0xF) << 36), 0);
 				cdd.CommandExec();
 			}
-			cdd.latency = 0;
+			// A play saved in its access goes on with the rest of the access, which the
+			// context holds: software saw the seek begin and starts its read when the play
+			// is reported, and a drive that played at once sent the first sector before
+			// that. A pause has no access left.
+			cdd.latency = cstat == CD_STAT_PLAY ? (int)(uint16_t)(packed >> 16) : 0;
 			// A stale packet answers the command before the pending one. Repeated, it
 			// would answer a play with the pause before it, so the drive answers instead.
 			if (stale) {
