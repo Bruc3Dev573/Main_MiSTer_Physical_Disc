@@ -203,7 +203,9 @@ void mcd_poll()
 		// so that every status (CDD interrupt) comes with exactly one sector of subcode, as on a real drive.
 		poll_timer = GetTimer(1);
 	}
-	else if (!poll_timer || CheckTimer(poll_timer))
+	// A status goes out at least 3 ms after the sector it reports and before the next
+	// sector: after a stall, an update that is already due waits for the status.
+	else if ((!poll_timer || CheckTimer(poll_timer)) && !(status_timer && !CheckTimer(status_timer)))
 	{
 		if (paced) {
 			// MEGACD_CDDA_PACED=1: one audio sector (and its subcode) with each status, every 13.25 ms
@@ -260,19 +262,24 @@ void mcd_poll()
 
 		// The drive sends its status about 3 ms after the sector it reports, and about
 		// 10 ms before the next one. The status is taken now, before that sector is sent,
-		// so a command that comes within the 3 ms does not move the reported position past it.
+		// so a command that comes within the 3 ms does not move the reported position past it,
+		// and its 3 ms count from the end of the sector: when Main's loop stalls in the
+		// update, before the sector goes out, the status must still come well after the
+		// sector's decoder interrupt, not right with it.
 		// While the host clocks commands (one came in the last two frames) the drive answers
 		// every frame, also when the frame's command has not come yet: after a stall of
 		// Main's loop the updates catch up faster than the core resends its command, and
 		// without this those updates would send no status and the frame rate would drop.
+		int taken = 0;
 		if (has_command || (last_command_ms && (int32_t)(GetTimer(0) - last_command_ms) < 27)) {
 			status = cdd.GetStatus(0);
 			status_data = cdd.isData;
-			status_timer = GetTimer(3);
 			has_command = 0;
+			taken = 1;
 		}
 
 		cdd.Update();
+		if (taken) status_timer = GetTimer(3);
 	}
 
 	if (status_timer && CheckTimer(status_timer))
