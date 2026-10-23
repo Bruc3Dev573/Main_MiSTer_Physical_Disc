@@ -16,6 +16,7 @@
 #include "menu.h"
 #include "shmem.h"
 #include "offload.h"
+#include "user_io.h"
 
 #include "fpga_base_addr_ac5.h"
 #include "fpga_manager.h"
@@ -425,6 +426,8 @@ static int make_env(const char *name, const char *cfg)
 
 int fpga_load_rbf(const char *name, const char *cfg, const char *xml)
 {
+	// A slot file still being written is finished before the core goes.
+	process_ss_flush();
 	OsdDisable();
 	static char path[1024];
 	int ret = 0;
@@ -587,6 +590,7 @@ int fpga_get_hdmi_int()
 
 void reboot(int cold)
 {
+	process_ss_flush();
 	sync();
 	fpga_core_reset(1);
 
@@ -619,6 +623,7 @@ char *getappname()
 
 void app_restart(const char *path, const char *xml, const char *exe)
 {
+	process_ss_flush();
 	sync();
 	fpga_core_reset(1);
 

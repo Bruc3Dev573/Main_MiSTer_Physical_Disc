@@ -1931,26 +1931,38 @@ void* process_ss_slot_ptr(int i, uint32_t min_size)
 	return (ss_base && min_size <= ss_size && i >= 0 && i < 4) ? ss_slot_base[i] : 0;
 }
 
+// A slot file is written a piece per call of process_ss, so that Main's loop keeps running
+// while the card takes it. Written in one go, the loop stopped for about 150 ms, and with
+// it the CD drive of the MegaCD core: the game saw the drive stall after every save, and
+// read again.
+static FileSaveJob ss_job = {};
+static int ss_job_slot = -1;
+
+// Writes the rest of a slot file in one go. Called before anything that ends the session
+// (another game or core, a reboot) or changes the slot being written, so the file is
+// never left half written: the save it began with is on the card.
+void process_ss_flush()
+{
+	if (ss_job_slot < 0) return;
+	int ret;
+	while ((ret = FileSaveStep(&ss_job, 64 * 1024)) > 0);
+	if (!ret) printf("Wrote %d bytes to file: %s\n", ss_job.size, ss_job.path);
+	ss_job_slot = -1;
+}
+
 int process_ss(const char *rom_name, int enable)
 {
 	static char ss_name[1024] = {};
 	static char *ss_sufx = 0;
 	void **base = ss_slot_base;
 	static int enabled = 0;
-	// A slot file is written a piece per call, so that Main's loop keeps running while the
-	// card takes it. Written in one go, the loop stopped for about 150 ms, and with it the
-	// CD drive of the MegaCD core: the game saw the drive stall after every save, and read
-	// again. A slot saved again while its file is written is written again at the next
-	// check; a load echo changes only the counter.
-	static FileSaveJob ss_job = {};
-	static int ss_job_slot = -1;
+	static unsigned long ss_timer = 0;
 
 	if (!ss_base) return 0;
 
 	if (rom_name)
 	{
-		if (ss_job_slot >= 0) FileSaveAbort(&ss_job);
-		ss_job_slot = -1;
+		process_ss_flush();
 		enabled = enable;
 		if (!enabled) return 0;
 		ss_last_changed = 0;
@@ -2010,16 +2022,25 @@ int process_ss(const char *rom_name, int enable)
 
 	if (ss_job_slot >= 0)
 	{
-		int ret = FileSaveStep(&ss_job, 64 * 1024);
-		if (ret <= 0)
+		// Saved again or loaded while its file is written: the file is finished first, then
+		// the slot is looked at again at once, which writes a new save from the start.
+		if (((uint32_t*)(base[ss_job_slot]))[0] != ss_cnt[ss_job_slot])
 		{
-			if (!ret) printf("Wrote %d bytes to file: %s\n", ss_job.size, ss_job.path);
-			ss_job_slot = -1;
+			process_ss_flush();
+			ss_timer = 0;
 		}
-		return 1;
+		else
+		{
+			int ret = FileSaveStep(&ss_job, 64 * 1024);
+			if (ret <= 0)
+			{
+				if (!ret) printf("Wrote %d bytes to file: %s\n", ss_job.size, ss_job.path);
+				ss_job_slot = -1;
+			}
+			return 1;
+		}
 	}
 
-	static unsigned long ss_timer = 0;
 	if (ss_timer && !CheckTimer(ss_timer)) return 0;
 	ss_timer = GetTimer(1000);
 
