@@ -116,8 +116,11 @@ void FileGenerateScreenshotName(const char *name, char *out_name, const char *ex
 
 int FileSave(const char *name, void *pBuffer, int size);
 // FileSave a piece at a time: FileSaveBegin (0 on error), then FileSaveStep until it
-// returns 0 (the file is in place) or -1 (error, nothing replaced). FileSaveAbort drops
-// an unfinished write.
+// returns 0 (the file is complete) or -1 (error). The file is written in place: a
+// successful FileSaveBegin has truncated it, so after a -1 or FileSaveAbort the old
+// contents are lost and the file holds only what was written so far. FileSaveAbort
+// closes the file. pBuffer must stay valid and unchanged until FileSaveStep returns 0
+// or -1, or FileSaveAbort is called.
 struct FileSaveJob
 {
 	int fd;
