@@ -1935,31 +1935,125 @@ void* process_ss_slot_ptr(int i, uint32_t min_size)
 // while the card takes it. Written in one go, the loop stopped for about 150 ms, and with
 // it the CD drive of the MegaCD core: the game saw the drive stall after every save, and
 // read again.
-// The pieces come from a copy of the slot taken when the write begins, not from the slot:
-// the core may save to the slot again before the file is finished, and it writes the new
-// image before its counter shows the new save. Read from the slot, such a file would hold
-// the start of one save and the rest of the other.
+// The pieces come from a copy of the slot, not from the slot: the core may save to the
+// slot again before the file is finished, and it writes the new image before its counter
+// shows the new save. Read from the slot, such a file would hold the start of one save and
+// the rest of the other. The copy is taken a piece per call too: in one go it takes about
+// 36 ms, more than two frames of the CD drive.
+// A save that ends during the copy shows in the counter: the copy starts again from that
+// save. A save that shows while the file is written makes the file finish from its copy
+// (the file is written in place, so dropping it would leave it cut short), then the new
+// save is copied and written. A save still under way when the copy ends is the one case
+// left: the file then holds part of it until the new save is written after it.
+// A load of the slot changes the counter too, but not the image: the write goes on.
+#define SS_PIECE (64 * 1024)
+static char ss_name[1024] = {};
+static char *ss_sufx = 0;
 static FileSaveJob ss_job = {};
 static int ss_job_slot = -1;
+static uint32_t ss_job_size = 0, ss_job_copied = 0;
 static uint8_t *ss_job_buf = 0;
 static uint32_t ss_job_buf_size = 0;
+static uint32_t ss_job_again = 0;
 
-// Writes the rest of a slot file in one go. Called before anything that ends the session
-// (another game or core, a reboot) or changes the slot being written, so the file is
-// never left half written: the save it began with is on the card.
+// Takes in a new counter of slot i. Returns the size in bytes of the new save it shows,
+// 0 if there is nothing to write (a load of the slot, or no valid image).
+static uint32_t ss_new_save(int i)
+{
+	uint32_t *b = (uint32_t*)ss_slot_base[i];
+	uint32_t size = b[1];
+	ss_last_changed = b;
+	ss_cnt[i] = b[0];
+	// Check the payload size before converting it to bytes or writing the context.
+	if (!size || ss_size < 8 || size > (ss_size - 8) / 4) return 0;
+	if (is_megacd() && size == MCD_SS_WORDS && !mcd_ss_presave(b, i)) return 0;
+	return (size + 2) * 4;
+}
+
+// Starts copying the new save of slot i, of size bytes.
+static void ss_job_start(int i, uint32_t size)
+{
+	MenuHide();
+	Info("Saving the state", 500);
+	ss_job_slot = -1;
+	if (ss_job_buf_size < size)
+	{
+		free(ss_job_buf);
+		ss_job_buf = (uint8_t*)malloc(size);
+		ss_job_buf_size = ss_job_buf ? size : 0;
+		if (!ss_job_buf)
+		{
+			printf("Unable to allocate %u bytes for the savestate!\n", size);
+			return;
+		}
+	}
+	ss_job_slot = i;
+	ss_job_size = size;
+	ss_job_copied = 0;
+}
+
+// A new save of the slot being copied or written, or 0.
+static uint32_t ss_job_resaved()
+{
+	int i = ss_job_slot;
+	return (((uint32_t*)ss_slot_base[i])[0] != ss_cnt[i]) ? ss_new_save(i) : 0;
+}
+
+// One piece of the job: of the copy, or of the file. Returns 0 once there is no job.
+static int ss_job_pass()
+{
+	if (ss_job_slot < 0) return 0;
+	uint32_t size = ss_job_resaved();
+
+	if (ss_job_copied < ss_job_size)
+	{
+		if (!size)
+		{
+			uint32_t len = ss_job_size - ss_job_copied;
+			if (len > SS_PIECE) len = SS_PIECE;
+			memcpy(ss_job_buf + ss_job_copied, (uint8_t*)ss_slot_base[ss_job_slot] + ss_job_copied, len);
+			ss_job_copied += len;
+			if (ss_job_copied < ss_job_size) return 1;
+
+			size = ss_job_resaved();
+			if (!size)
+			{
+				*ss_sufx = ss_job_slot + '1';
+				if (FileSaveBegin(&ss_job, ss_name, ss_job_buf, ss_job_size)) return 1;
+				ss_job_slot = -1;
+				return 0;
+			}
+		}
+		ss_job_start(ss_job_slot, size);
+		return ss_job_slot >= 0;
+	}
+
+	if (size) ss_job_again = size;
+
+	int ret = FileSaveStep(&ss_job, SS_PIECE);
+	if (ret > 0) return 1;
+	if (!ret) printf("Wrote %d bytes to file: %s\n", ss_job.size, ss_job.path);
+	if (ss_job_again)
+	{
+		size = ss_job_again;
+		ss_job_again = 0;
+		ss_job_start(ss_job_slot, size);
+		return ss_job_slot >= 0;
+	}
+	ss_job_slot = -1;
+	return 0;
+}
+
+// Copies and writes the rest of the job in one go, a new save of the slot included. Called
+// before anything that ends the session (another game or core, a reboot), so the file is
+// never left half written.
 void process_ss_flush()
 {
-	if (ss_job_slot < 0) return;
-	int ret;
-	while ((ret = FileSaveStep(&ss_job, 64 * 1024)) > 0);
-	if (!ret) printf("Wrote %d bytes to file: %s\n", ss_job.size, ss_job.path);
-	ss_job_slot = -1;
+	while (ss_job_pass());
 }
 
 int process_ss(const char *rom_name, int enable)
 {
-	static char ss_name[1024] = {};
-	static char *ss_sufx = 0;
 	void **base = ss_slot_base;
 	static int enabled = 0;
 	static unsigned long ss_timer = 0;
@@ -2028,25 +2122,8 @@ int process_ss(const char *rom_name, int enable)
 
 	if (ss_job_slot >= 0)
 	{
-		// Saved again or loaded while its file is written: the file is finished from its
-		// copy, then the slot is looked at again at once, which copies the new save and
-		// writes it from the start. The old write is finished rather than dropped so that
-		// the file on the card is complete in between, also where it is written in place.
-		if (((uint32_t*)(base[ss_job_slot]))[0] != ss_cnt[ss_job_slot])
-		{
-			process_ss_flush();
-			ss_timer = 0;
-		}
-		else
-		{
-			int ret = FileSaveStep(&ss_job, 64 * 1024);
-			if (ret <= 0)
-			{
-				if (!ret) printf("Wrote %d bytes to file: %s\n", ss_job.size, ss_job.path);
-				ss_job_slot = -1;
-			}
-			return 1;
-		}
+		ss_job_pass();
+		return 1;
 	}
 
 	if (ss_timer && !CheckTimer(ss_timer)) return 0;
@@ -2054,42 +2131,14 @@ int process_ss(const char *rom_name, int enable)
 
 	for (int i = 0; i < 4; i++)
 	{
-		if (base[i])
+		if (base[i] && ((uint32_t*)(base[i]))[0] != ss_cnt[i])
 		{
-			uint32_t curcnt = ((uint32_t*)(base[i]))[0];
-			uint32_t size = ((uint32_t*)(base[i]))[1];
-
-			if (curcnt != ss_cnt[i])
+			uint32_t size = ss_new_save(i);
+			if (size)
 			{
-				ss_last_changed = base[i];
-				ss_cnt[i] = curcnt;
-				// Check the payload size before converting it to bytes or writing the context.
-				if (size && ss_size >= 8 && size <= (ss_size - 8) / 4 &&
-				    !(is_megacd() && size == MCD_SS_WORDS && !mcd_ss_presave(base[i], i)))
-				{
-					size = (size + 2) * 4;
-					MenuHide();
-					Info("Saving the state", 500);
-
-					*ss_sufx = i + '1';
-					if (ss_job_buf_size < size)
-					{
-						free(ss_job_buf);
-						ss_job_buf = (uint8_t*)malloc(size);
-						ss_job_buf_size = ss_job_buf ? size : 0;
-						if (!ss_job_buf) printf("Unable to allocate %u bytes for the savestate!\n", size);
-					}
-					if (ss_job_buf)
-					{
-						memcpy(ss_job_buf, base[i], size);
-						if (FileSaveBegin(&ss_job, ss_name, ss_job_buf, size))
-						{
-							ss_job_slot = i;
-							// The other changed slots wait for the next check.
-							break;
-						}
-					}
-				}
+				ss_job_start(i, size);
+				// The other changed slots wait for the next check.
+				if (ss_job_slot >= 0) break;
 			}
 		}
 	}
