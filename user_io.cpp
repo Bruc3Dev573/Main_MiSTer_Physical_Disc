@@ -1935,8 +1935,14 @@ void* process_ss_slot_ptr(int i, uint32_t min_size)
 // while the card takes it. Written in one go, the loop stopped for about 150 ms, and with
 // it the CD drive of the MegaCD core: the game saw the drive stall after every save, and
 // read again.
+// The pieces come from a copy of the slot taken when the write begins, not from the slot:
+// the core may save to the slot again before the file is finished, and it writes the new
+// image before its counter shows the new save. Read from the slot, such a file would hold
+// the start of one save and the rest of the other.
 static FileSaveJob ss_job = {};
 static int ss_job_slot = -1;
+static uint8_t *ss_job_buf = 0;
+static uint32_t ss_job_buf_size = 0;
 
 // Writes the rest of a slot file in one go. Called before anything that ends the session
 // (another game or core, a reboot) or changes the slot being written, so the file is
@@ -2022,8 +2028,10 @@ int process_ss(const char *rom_name, int enable)
 
 	if (ss_job_slot >= 0)
 	{
-		// Saved again or loaded while its file is written: the file is finished first, then
-		// the slot is looked at again at once, which writes a new save from the start.
+		// Saved again or loaded while its file is written: the file is finished from its
+		// copy, then the slot is looked at again at once, which copies the new save and
+		// writes it from the start. The old write is finished rather than dropped so that
+		// the file on the card is complete in between, also where it is written in place.
 		if (((uint32_t*)(base[ss_job_slot]))[0] != ss_cnt[ss_job_slot])
 		{
 			process_ss_flush();
@@ -2064,11 +2072,22 @@ int process_ss(const char *rom_name, int enable)
 					Info("Saving the state", 500);
 
 					*ss_sufx = i + '1';
-					if (FileSaveBegin(&ss_job, ss_name, base[i], size))
+					if (ss_job_buf_size < size)
 					{
-						ss_job_slot = i;
-						// The other changed slots wait for the next check.
-						break;
+						free(ss_job_buf);
+						ss_job_buf = (uint8_t*)malloc(size);
+						ss_job_buf_size = ss_job_buf ? size : 0;
+						if (!ss_job_buf) printf("Unable to allocate %u bytes for the savestate!\n", size);
+					}
+					if (ss_job_buf)
+					{
+						memcpy(ss_job_buf, base[i], size);
+						if (FileSaveBegin(&ss_job, ss_name, ss_job_buf, size))
+						{
+							ss_job_slot = i;
+							// The other changed slots wait for the next check.
+							break;
+						}
 					}
 				}
 			}
