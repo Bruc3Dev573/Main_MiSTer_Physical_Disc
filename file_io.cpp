@@ -769,10 +769,22 @@ int FileSaveStep(FileSaveJob *job, int max)
 		FileSaveAbort(job);
 		return -1;
 	}
-	job->done += ret;
-	if (ret == len && job->done < job->size) return 1;
+	if (ret != len)
+	{
+		printf("FileSave(write) File:%s, short write: %d of %d bytes.\n", job->path, job->done + ret, job->size);
+		FileSaveAbort(job);
+		return -1;
+	}
+	job->done += len;
+	if (job->done < job->size) return 1;
 
-	FileSaveAbort(job);
+	int fd = job->fd;
+	job->fd = -1;
+	if (close(fd))
+	{
+		printf("FileSave(close) File:%s, error: %d.\n", job->path, errno);
+		return -1;
+	}
 	return 0;
 }
 
