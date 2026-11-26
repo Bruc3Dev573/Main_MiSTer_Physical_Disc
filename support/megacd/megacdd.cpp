@@ -987,11 +987,14 @@ void cdd_t::Update() {
 void cdd_t::CommandExec() {
 	msf_t msf;
 
-	// While HOCK is set the core resends the command registers every frame. A play or
-	// seek resent unchanged must not restart the access, so it only reports the status
-	// like IDLE. The same command written again by software still restarts it.
+	// While HOCK is set the core resends the command registers every frame. A play,
+	// seek or resume resent unchanged must not restart the access, so it only reports
+	// the status like IDLE. The same command written again by software still restarts
+	// it. A resent resume would reset audioOffset each frame, so every CD-DA send would
+	// carry two sectors and overflow the core's CD-DA FIFO.
 	uint8_t cmd = comm[0];
-	if (this->resend && (cmd == CD_COMM_PLAY || cmd == CD_COMM_SEEK || cmd == CD_COMM_TRACK_PLAY) &&
+	if (this->resend && (cmd == CD_COMM_PLAY || cmd == CD_COMM_SEEK || cmd == CD_COMM_TRACK_PLAY ||
+	                     cmd == CD_COMM_RESUME) &&
 	    !memcmp(comm, last_comm, sizeof(comm)))
 		cmd = CD_COMM_IDLE;
 	this->resend = 0;
